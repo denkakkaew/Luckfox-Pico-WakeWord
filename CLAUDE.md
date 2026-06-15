@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Phase 1 (training) is implemented: `pc/train_export.py` trains the CNN and exports the artifacts. The remaining source files (`pc/convert_rknn.py`, `board/kws.c`, `board/Makefile`) are specified in the README but not yet written; treat the README as the design spec and this file as the architectural summary when implementing them.
+Phases 1–2 (PC side) are implemented and verified in the dev container:
+- `pc/train_export.py` trains the CNN and exports `artifacts/{kws_core.tflite, calib/*.npy, dataset.txt, labels.txt}` (test acc ~0.82 on the demo set).
+- `pc/convert_rknn.py` quantizes to `artifacts/kws.rknn` (INT8, rv1106) and runs a simulator check; INT8↔float parity is 5/5 on the sampled calib clips.
+
+The remaining source files (`board/kws.c`, `board/Makefile`) are specified in the README but not yet written; treat the README as the design spec and this file as the architectural summary when implementing them.
 
 ## Repository layout
 
@@ -115,5 +119,7 @@ arecord -D hw:0,0 -f S16_LE -r 16000 -c 1 -t raw | ./kws kws.rknn
 ## Platform-specific gotchas
 
 - **RV1103/RV1106 support only the zero-copy RKNN API** (`rknn_create_mem` / `rknn_set_io_mem`). Do **not** use `rknn_inputs_set` from generic RK3588 examples.
+- **`onnx` version pin**: rknn-toolkit2 pulls `onnx>=1.16.1`, but `onnx>=1.18` references `ml_dtypes.float4_e2m1fn` (absent in the `ml_dtypes 0.3.x` that `tensorflow-cpu<2.16` pins), which crashes `from rknn.api import RKNN`. `requirements.txt` therefore caps `onnx>=1.16.1,<1.18`.
+- **RKNN calibration layout**: after `load_tflite` (NHWC), rknn's internal graph is **NCHW** and expects calibration `.npy` in NCHW. Phase-1 calib files are HWC `(124,129,1)`; `convert_rknn.py` transposes copies to `(1,124,129)` (rknn prepends batch → `(1,1,124,129)`) into `artifacts/_calib_nchw/`. Inference can stay NHWC via `data_format=["nhwc"]`.
 - Detector tuning constants live in a marked block in `board/kws.c`: `THRESHOLD` (0.85), `CONSEC_NEEDED` (2), `COOLDOWN_HOPS` (8), `HOP_SAMPLES` (4000 = 250 ms inference cadence).
 - `pc/train_export.py` already uses **log-spectrograms** (`tf.math.log(tf.abs(...)+1e-6)`); `board/kws.c` must match with `logf(mag+1e-6f)`. Both sides must always change together.

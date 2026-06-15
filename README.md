@@ -157,11 +157,12 @@ python pc/convert_rknn.py
 ```
 
 Produces **`artifacts/kws.rknn`** (INT8, target `rv1106` — also valid for
-`rv1103`) and runs a quick simulator check so you can see class probabilities
-before touching the board.
+`rv1103`) and runs a quick simulator check so you can see class probabilities,
+plus an INT8-vs-float parity check, before touching the board.
 
-> The calibration `.npy` files are already saved without a batch dim
-> (`(124, 129, 1)`), which is what `rknn.build()` expects.
+> The calibration `.npy` are stored HWC `(124, 129, 1)`; rknn-toolkit2's graph
+> is channel-first, so `convert_rknn.py` transposes copies to NCHW
+> (`artifacts/_calib_nchw/`) automatically before building.
 
 ---
 
