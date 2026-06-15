@@ -1,0 +1,251 @@
+# Luckfox-Pico-WakeWord
+
+On-device keyword spotting based on the TensorFlow
+[simple_audio](https://www.tensorflow.org/tutorials/audio/simple_audio) tutorial,
+deployed to the Luckfox Pico NPU via RKNN.
+
+The model detects a single **wake word** from a short list of keywords and prints
+a trigger you can hook up to GPIO, MQTT, an HTTP call, or anything else.
+
+---
+
+## The one thing you must understand first
+
+**RKNN cannot convert `tf.signal.stft`.** The tutorial wraps the STFT
+(audio → spectrogram) *inside* the Keras model. That part will not compile for
+the NPU.
+
+So the model is split in two:
+
+| Stage | Runs on | What it does |
+|-------|---------|--------------|
+| Mic capture + **STFT spectrogram** | **CPU** (C code on the board) | 1 s of PCM → 124×129 magnitude spectrogram |
+| **CNN core** (Resizing → Norm → Conv → Dense) | **NPU** (`.rknn`, INT8) | spectrogram → class logits |
+
+The C program reimplements the exact STFT math the tutorial uses
+(periodic Hann window 255, hop 128, FFT 256), so training and inference stay
+consistent.
+
+---
+
+## Pipeline overview
+
+```
+   PC (x86_64 Linux)                         Luckfox Pico (RV1103/RV1106)
+   ────────────────────                      ────────────────────────────
+   train_export.py                           arecord  (S16_LE 16k mono)
+      │  trains tutorial CNN                       │  raw PCM on stdin
+      │  exports CNN core (no STFT)                ▼
+      ▼                                        kws  (C program)
+   kws_core.tflite  + calib/ + labels.txt       │  STFT in C  → spectrogram
+      │                                          │  INT8 quantize
+   convert_rknn.py                               ▼
+      │  INT8 quantize for rv1106            kws.rknn on NPU → logits
+      ▼                                          │  softmax + threshold
+   kws.rknn  ───────────  scp  ──────────►       ▼
+                                             "WAKE: yes (p=0.97)"
+```
+
+---
+
+## Files in this project
+
+| File | Where it runs | Purpose |
+|------|---------------|---------|
+| `train_export.py` | PC | Train the KWS CNN, export `kws_core.tflite` + calibration data + `labels.txt` |
+| `convert_rknn.py` | PC | Convert TFLite → `kws.rknn` (INT8, target `rv1106`) |
+| `kws.c` | Board | Mic capture → STFT → NPU inference → wake-word logic |
+| `Makefile` | PC (cross-compile) | Build `kws` for the board's ARM uClibc target |
+| `README.md` | — | This guide |
+
+---
+
+## Prerequisites
+
+### On your PC (x86_64 Linux recommended)
+
+```bash
+pip install "tensorflow<2.16" numpy rknn-toolkit2
+```
+
+- `rknn-toolkit2` is x86_64-only; it will not install on the board or on Apple Silicon.
+- If you only have macOS/Windows, run the PC steps in a Linux VM or container.
+
+### Two SDKs for cross-compiling (Step 3)
+
+```bash
+# 1) Luckfox SDK — provides the cross toolchain
+git clone https://github.com/LuckfoxTECH/luckfox-pico.git ~/luckfox-pico
+
+# 2) RKNN runtime — provides librknnmrt.so + rknn_api.h
+git clone https://github.com/airockchip/rknn-toolkit2.git ~/rknn-toolkit2
+```
+
+### Hardware
+
+- A **Luckfox Pico** board. Prefer an **RV1106** variant (256 MB RAM) over the
+  64 MB RV1103 boards — more headroom for audio buffers.
+- A **microphone**. The base board has none. Use a USB audio mic or an I2S MEMS
+  mic such as the **INMP441**. Confirm with `arecord -l` on the board.
+
+---
+
+## Step 1 — Train & export (PC)
+
+```bash
+python train_export.py                  # demo: mini_speech_commands (8 words)
+# or
+python train_export.py path/to/dataset  # your own wake-word dataset
+```
+
+First run with the default dataset to validate the whole pipeline end-to-end,
+using **"yes"** as a stand-in wake word.
+
+**Outputs:**
+
+- `kws_core.tflite` — float CNN, input spectrogram `(1, 124, 129, 1)`
+- `calib/*.npy` + `dataset.txt` — calibration set for INT8 quantization
+- `labels.txt` — class order (**alphabetical** — you'll need this in Step 3)
+
+### Your own dataset layout
+
+1-second clips, **16 kHz, mono, WAV**:
+
+```
+dataset/
+  wake/      *.wav   200+ recordings of your wake word (varied speakers, distances, rooms)
+  unknown/   *.wav   other words & random speech  (hard negatives)
+  noise/     *.wav   background noise (clinic ambience, fans, A/C, chatter)
+```
+
+More variety in `wake/` and good hard negatives in `unknown/` matter far more
+than model size for real-world reliability.
+
+---
+
+## Step 2 — Convert to RKNN (PC)
+
+```bash
+python convert_rknn.py
+```
+
+Produces **`kws.rknn`** (INT8, target `rv1106` — also valid for `rv1103`) and
+runs a quick simulator check so you can see class probabilities before touching
+the board.
+
+> If `rknn.build()` complains about the calibration `.npy` shape, edit
+> `train_export.py` to save `arr[0]` (drop the batch dim) and re-run Step 1.
+
+---
+
+## Step 3 — Cross-compile the board app (PC)
+
+Edit the two paths at the top of the `Makefile` if your clones live elsewhere:
+
+```make
+TOOLCHAIN ?= $(HOME)/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-
+RKNN_RT   ?= $(HOME)/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api
+```
+
+Then **match the labels to your training run**. Open `kws.c` and update this
+block from your `labels.txt` (remember: alphabetical order):
+
+```c
+#define NUM_CLASSES   8
+static const char *LABELS[NUM_CLASSES] =
+    { "down", "go", "left", "no", "right", "stop", "up", "yes" };
+#define WAKE_IDX      7      /* index of YOUR wake word in LABELS[] */
+```
+
+Build:
+
+```bash
+make
+```
+
+You'll also need `librknnmrt.so` on the board (see Step 4).
+
+---
+
+## Step 4 — Deploy & run (board)
+
+Copy the binary, the model, and the runtime library:
+
+```bash
+scp kws kws.rknn root@<board-ip>:/root/
+scp ~/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/armhf-uclibc/librknnmrt.so \
+    root@<board-ip>:/usr/lib/
+```
+
+On the board:
+
+```bash
+arecord -l    # confirm a capture device exists (else fix your mic first)
+
+arecord -D hw:0,0 -f S16_LE -r 16000 -c 1 -t raw | ./kws kws.rknn
+```
+
+On detection it prints:
+
+```
+WAKE: yes (p=0.97)
+```
+
+Hook your action into the `TODO` block near the bottom of `kws.c`.
+
+---
+
+## Tuning the detector
+
+All in the marked block in `kws.c`:
+
+| Constant | Effect |
+|----------|--------|
+| `THRESHOLD` (0.85) | Raise to cut false triggers; lower if it misses the word |
+| `CONSEC_NEEDED` (2) | Hits in a row before firing — higher = stricter |
+| `COOLDOWN_HOPS` (8) | Refractory period after a trigger (~2 s), stops repeats |
+| `HOP_SAMPLES` (4000) | Inference cadence (250 ms). Smaller = snappier, more CPU |
+
+---
+
+## Troubleshooting
+
+**`rknn_inputs_set` undefined / runtime errors.**
+RV1103/RV1106 support **only the zero-copy API**. This code already uses
+`rknn_create_mem` / `rknn_set_io_mem`. Don't copy generic RK3588 examples that
+use `rknn_inputs_set`.
+
+**Detects the wrong word.**
+`LABELS[]` / `WAKE_IDX` don't match `labels.txt`. The order is alphabetical, not
+the order folders appear on disk.
+
+**`arecord -l` lists no devices.**
+No mic detected. Wire up a USB or I2S mic; the bare board has none.
+
+**Poor real-world accuracy.**
+Linear-magnitude spectrograms have a harsh dynamic range for INT8. Switch to a
+**log-spectrogram**:
+
+- training (`train_export.py`): `spectrogram = tf.math.log(tf.abs(...) + 1e-6)`
+- C (`kws.c`, in `compute_spectrogram`): `out[k] = logf(mag + 1e-6f);`
+
+Keep both sides identical. This usually quantizes far better. (The code ships
+with the tutorial's exact linear math first, so you can verify parity before
+changing anything.)
+
+**Too many false triggers in the clinic.**
+Add more `noise/` and `unknown/` data, augment training with noise mixing and
+small time shifts, then raise `THRESHOLD` / `CONSEC_NEEDED`.
+
+**`model shape mismatch` on startup.**
+`NUM_CLASSES` in `kws.c` doesn't match the trained model's output. Update it to
+the number of lines in `labels.txt` and rebuild.
+
+---
+
+## Realistic expectations
+
+The tutorial model is a **demo-grade** classifier. It's perfect for proving the
+pipeline, but a production wake word ("Hey Clinic") needs a few hundred
+recordings of your actual phrase plus solid hard negatives. Treat the
+mini_speech_commands run as your smoke test, then invest in a real dataset.
