@@ -105,9 +105,11 @@ make -C board
 ```
 
 ### Deploy & run (board)
+Default Luckfox login over the USB gadget is `pico@172.32.0.70` (password `luckfox`); adjust user/IP for your board. The `pico` user can't write to `/root` or `/usr/lib`, so copy to its home and move the lib with `sudo`.
 ```bash
-scp board/kws artifacts/kws.rknn root@<board-ip>:/root/
-scp ~/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/armhf-uclibc/librknnmrt.so root@<board-ip>:/usr/lib/
+scp board/kws artifacts/kws.rknn pico@172.32.0.70:~/
+scp ~/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/armhf-uclibc/librknnmrt.so pico@172.32.0.70:~/
+ssh pico@172.32.0.70 'sudo mv ~/librknnmrt.so /usr/lib/'
 # on board:
 arecord -D hw:0,0 -f S16_LE -r 16000 -c 1 -t raw | ./kws kws.rknn
 ```

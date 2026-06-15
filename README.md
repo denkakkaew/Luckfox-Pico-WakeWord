@@ -201,14 +201,20 @@ You'll also need `librknnmrt.so` on the board (see Step 4).
 
 ## Step 4 — Deploy & run (board)
 
-Copy the binary, the model, and the runtime library:
+Copy the binary, the model, and the runtime library. This assumes the default
+Luckfox login over the USB gadget (`pico@172.32.0.70`, password `luckfox` — adjust
+user/IP for your board). The `pico` user can't write to `/root` or `/usr/lib`
+directly, so copy to its home dir and move the library with `sudo`:
 
 ```bash
-scp board/kws artifacts/kws.rknn root@<board-ip>:/root/
+scp board/kws artifacts/kws.rknn pico@172.32.0.70:~/
 scp ~/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/armhf-uclibc/librknnmrt.so \
-    root@<board-ip>:/usr/lib/
+    pico@172.32.0.70:~/
 # In the dev container the runtime lives under $RKNN_RT:
-# scp "$RKNN_RT/armhf-uclibc/librknnmrt.so" root@<board-ip>:/usr/lib/
+# scp "$RKNN_RT/armhf-uclibc/librknnmrt.so" pico@172.32.0.70:~/
+
+# then on the board, install the runtime lib:
+ssh pico@172.32.0.70 'sudo mv ~/librknnmrt.so /usr/lib/'
 ```
 
 On the board:
