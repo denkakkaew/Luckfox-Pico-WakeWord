@@ -1,0 +1,48 @@
+{
+  "name": "Luckfox-Pico-WakeWord",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  // rknn-toolkit2 and the prebuilt cross toolchain are x86_64 only.
+  "runArgs": ["--platform=linux/amd64"],
+
+  // Persist the large SDK clones (Luckfox toolchain + RKNN runtime) in a named
+  // volume so they survive container rebuilds. Populated by setup-sdks.sh.
+  // The claude-config volume persists your Claude Code login/config so you only
+  // authenticate once, even across rebuilds.
+  "mounts": [
+    "source=luckfox-sdks,target=/opt/sdks,type=volume",
+    "source=luckfox-claude-config,target=/home/vscode/.claude,type=volume"
+  ],
+
+  // The Makefile reads TOOLCHAIN/RKNN_RT via `?=`, so pointing them at the
+  // mounted SDKs means you never have to edit the Makefile inside the container.
+  "containerEnv": {
+    "SDK_ROOT": "/opt/sdks",
+    "TOOLCHAIN": "/opt/sdks/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-",
+    "RKNN_RT": "/opt/sdks/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api",
+    // CPU-only: hide any GPU from TensorFlow and quiet the CUDA probe logs.
+    "CUDA_VISIBLE_DEVICES": "-1",
+    "TF_CPP_MIN_LOG_LEVEL": "2"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  },
+
+  // Named volumes are owned by root on first mount; hand them to vscode, then
+  // verify the Python stack. Run setup-sdks.sh yourself when you cross-compile.
+  "postCreateCommand": "sudo chown -R vscode:vscode /opt/sdks /home/vscode/.claude && bash .devcontainer/post-create.sh",
+
+  "remoteUser": "vscode"
+}

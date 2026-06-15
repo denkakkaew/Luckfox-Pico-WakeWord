@@ -23,8 +23,8 @@ So the model is split in two:
 | **CNN core** (Resizing → Norm → Conv → Dense) | **NPU** (`.rknn`, INT8) | spectrogram → class logits |
 
 The C program reimplements the exact STFT math the tutorial uses
-(periodic Hann window 255, hop 128, FFT 256), so training and inference stay
-consistent.
+(periodic Hann window 255, hop 128, FFT 256) followed by a **log-magnitude**
+(`logf(mag + 1e-6f)`), so training and inference stay consistent.
 
 ---
 
@@ -33,16 +33,16 @@ consistent.
 ```
    PC (x86_64 Linux)                         Luckfox Pico (RV1103/RV1106)
    ────────────────────                      ────────────────────────────
-   train_export.py                           arecord  (S16_LE 16k mono)
+   pc/train_export.py                        arecord  (S16_LE 16k mono)
       │  trains tutorial CNN                       │  raw PCM on stdin
       │  exports CNN core (no STFT)                ▼
       ▼                                        kws  (C program)
-   kws_core.tflite  + calib/ + labels.txt       │  STFT in C  → spectrogram
-      │                                          │  INT8 quantize
-   convert_rknn.py                               ▼
+   artifacts/kws_core.tflite                    │  STFT in C  → log-spectrogram
+      │   + calib/ + labels.txt                  │  INT8 quantize
+   pc/convert_rknn.py                            ▼
       │  INT8 quantize for rv1106            kws.rknn on NPU → logits
       ▼                                          │  softmax + threshold
-   kws.rknn  ───────────  scp  ──────────►       ▼
+   artifacts/kws.rknn  ─────  scp  ──────►       ▼
                                              "WAKE: yes (p=0.97)"
 ```
 
@@ -52,26 +52,53 @@ consistent.
 
 | File | Where it runs | Purpose |
 |------|---------------|---------|
-| `train_export.py` | PC | Train the KWS CNN, export `kws_core.tflite` + calibration data + `labels.txt` |
-| `convert_rknn.py` | PC | Convert TFLite → `kws.rknn` (INT8, target `rv1106`) |
-| `kws.c` | Board | Mic capture → STFT → NPU inference → wake-word logic |
-| `Makefile` | PC (cross-compile) | Build `kws` for the board's ARM uClibc target |
+| `pc/train_export.py` | PC | Train the KWS CNN, export `kws_core.tflite` + calibration data + `labels.txt` |
+| `pc/convert_rknn.py` | PC | Convert TFLite → `kws.rknn` (INT8, target `rv1106`) |
+| `board/kws.c` | Board | Mic capture → STFT → NPU inference → wake-word logic |
+| `board/Makefile` | PC (cross-compile) | Build `kws` for the board's ARM uClibc target |
 | `README.md` | — | This guide |
+
+All generated outputs land in `artifacts/` (gitignored); dataset downloads land in `data/`.
 
 ---
 
 ## Prerequisites
 
-### On your PC (x86_64 Linux recommended)
+### Option A — Dev container (recommended)
+
+The repo ships a [`.devcontainer/`](.devcontainer/) that builds a clean,
+reproducible **x86_64 Linux** environment (Python 3.10, `tensorflow<2.16`,
+`rknn-toolkit2`, the cross-compile toolchain libs) so you don't have to pollute
+your WSL/host setup.
+
+1. Open the folder in **VS Code** → *Reopen in Container* (needs the Dev
+   Containers extension + Docker).
+2. On first start it verifies the Python stack. To cross-compile (Step 3), fetch
+   the external SDKs once — they land in a persistent volume, not your repo:
+
+   ```bash
+   bash .devcontainer/setup-sdks.sh
+   ```
+
+The container exports `TOOLCHAIN` and `RKNN_RT` pointing at those SDKs, so the
+`Makefile` picks them up automatically — **no Makefile edits needed**.
+
+**Claude Code** is preinstalled in the container — just run `claude` and log in
+once (your login persists across rebuilds in a dedicated volume).
+
+> The container is pinned to `linux/amd64` because `rknn-toolkit2` and the
+> prebuilt toolchain are x86_64-only. On Apple Silicon it runs under emulation.
+
+### Option B — Local install (x86_64 Linux)
 
 ```bash
 pip install "tensorflow<2.16" numpy rknn-toolkit2
 ```
 
 - `rknn-toolkit2` is x86_64-only; it will not install on the board or on Apple Silicon.
-- If you only have macOS/Windows, run the PC steps in a Linux VM or container.
+- If you only have macOS/Windows, use the dev container or a Linux VM.
 
-### Two SDKs for cross-compiling (Step 3)
+Then grab the two SDKs for cross-compiling (Step 3):
 
 ```bash
 # 1) Luckfox SDK — provides the cross toolchain
@@ -93,19 +120,19 @@ git clone https://github.com/airockchip/rknn-toolkit2.git ~/rknn-toolkit2
 ## Step 1 — Train & export (PC)
 
 ```bash
-python train_export.py                  # demo: mini_speech_commands (8 words)
+python pc/train_export.py                  # demo: mini_speech_commands (8 words)
 # or
-python train_export.py path/to/dataset  # your own wake-word dataset
+python pc/train_export.py path/to/dataset  # your own wake-word dataset
 ```
 
-First run with the default dataset to validate the whole pipeline end-to-end,
-using **"yes"** as a stand-in wake word.
+Run from the repo root. First run with the default dataset to validate the
+whole pipeline end-to-end, using **"yes"** as a stand-in wake word.
 
-**Outputs:**
+**Outputs (in `artifacts/`):**
 
-- `kws_core.tflite` — float CNN, input spectrogram `(1, 124, 129, 1)`
-- `calib/*.npy` + `dataset.txt` — calibration set for INT8 quantization
-- `labels.txt` — class order (**alphabetical** — you'll need this in Step 3)
+- `artifacts/kws_core.tflite` — float CNN, input spectrogram `(1, 124, 129, 1)`
+- `artifacts/calib/*.npy` + `artifacts/dataset.txt` — calibration set for INT8 quantization
+- `artifacts/labels.txt` — class order (**alphabetical** — you'll need this in Step 3)
 
 ### Your own dataset layout
 
@@ -126,29 +153,33 @@ than model size for real-world reliability.
 ## Step 2 — Convert to RKNN (PC)
 
 ```bash
-python convert_rknn.py
+python pc/convert_rknn.py
 ```
 
-Produces **`kws.rknn`** (INT8, target `rv1106` — also valid for `rv1103`) and
-runs a quick simulator check so you can see class probabilities before touching
-the board.
+Produces **`artifacts/kws.rknn`** (INT8, target `rv1106` — also valid for
+`rv1103`) and runs a quick simulator check so you can see class probabilities
+before touching the board.
 
-> If `rknn.build()` complains about the calibration `.npy` shape, edit
-> `train_export.py` to save `arr[0]` (drop the batch dim) and re-run Step 1.
+> The calibration `.npy` files are already saved without a batch dim
+> (`(124, 129, 1)`), which is what `rknn.build()` expects.
 
 ---
 
 ## Step 3 — Cross-compile the board app (PC)
 
-Edit the two paths at the top of the `Makefile` if your clones live elsewhere:
+**In the dev container this is already wired up** — `TOOLCHAIN` and `RKNN_RT`
+are exported as env vars, so you can skip straight to editing the labels below.
+
+For a local install, edit the two paths at the top of `board/Makefile` if your
+clones live elsewhere (both use `?=`, so an env var or `make TOOLCHAIN=...` wins):
 
 ```make
 TOOLCHAIN ?= $(HOME)/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-
 RKNN_RT   ?= $(HOME)/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api
 ```
 
-Then **match the labels to your training run**. Open `kws.c` and update this
-block from your `labels.txt` (remember: alphabetical order):
+Then **match the labels to your training run**. Open `board/kws.c` and update
+this block from your `artifacts/labels.txt` (remember: alphabetical order):
 
 ```c
 #define NUM_CLASSES   8
@@ -160,7 +191,7 @@ static const char *LABELS[NUM_CLASSES] =
 Build:
 
 ```bash
-make
+make -C board
 ```
 
 You'll also need `librknnmrt.so` on the board (see Step 4).
@@ -172,9 +203,11 @@ You'll also need `librknnmrt.so` on the board (see Step 4).
 Copy the binary, the model, and the runtime library:
 
 ```bash
-scp kws kws.rknn root@<board-ip>:/root/
+scp board/kws artifacts/kws.rknn root@<board-ip>:/root/
 scp ~/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/armhf-uclibc/librknnmrt.so \
     root@<board-ip>:/usr/lib/
+# In the dev container the runtime lives under $RKNN_RT:
+# scp "$RKNN_RT/armhf-uclibc/librknnmrt.so" root@<board-ip>:/usr/lib/
 ```
 
 On the board:
@@ -223,15 +256,13 @@ the order folders appear on disk.
 No mic detected. Wire up a USB or I2S mic; the bare board has none.
 
 **Poor real-world accuracy.**
-Linear-magnitude spectrograms have a harsh dynamic range for INT8. Switch to a
-**log-spectrogram**:
+This build already uses **log-spectrograms** for better INT8 dynamic range:
 
-- training (`train_export.py`): `spectrogram = tf.math.log(tf.abs(...) + 1e-6)`
-- C (`kws.c`, in `compute_spectrogram`): `out[k] = logf(mag + 1e-6f);`
+- training (`pc/train_export.py`): `spectrogram = tf.math.log(tf.abs(...) + 1e-6)`
+- C (`board/kws.c`, in `compute_spectrogram`): `out[k] = logf(mag + 1e-6f);`
 
-Keep both sides identical. This usually quantizes far better. (The code ships
-with the tutorial's exact linear math first, so you can verify parity before
-changing anything.)
+Both sides **must** stay identical — if you ever change one, change the other.
+If accuracy is still poor, invest in more/better training data (see below).
 
 **Too many false triggers in the clinic.**
 Add more `noise/` and `unknown/` data, augment training with noise mixing and

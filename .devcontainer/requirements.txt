@@ -1,0 +1,10 @@
+# PC-side dependencies for training and RKNN conversion.
+# Keep this in sync with the README "Prerequisites" section.
+#
+# tensorflow < 2.16 keeps Keras 2 (the tutorial CNN targets Keras 2 APIs).
+# tensorflow-cpu: CPU-only build — no CUDA/cuDNN wheels, smaller image, and the
+# KWS model trains fine on CPU. rknn-toolkit2 is x86_64-only; it will not
+# install on the board or Apple Silicon.
+tensorflow-cpu<2.16
+numpy
+rknn-toolkit2
