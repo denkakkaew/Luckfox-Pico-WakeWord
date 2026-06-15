@@ -4,7 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Only `README.md` exists so far. The files below are specified in the README but not yet written; treat the README as the design spec and this file as the architectural summary when implementing them.
+Phases 1–2 (PC side) are implemented and verified in the dev container:
+- `pc/train_export.py` trains the CNN and exports `artifacts/{kws_core.tflite, calib/*.npy, dataset.txt, labels.txt}` (test acc ~0.82 on the demo set).
+- `pc/convert_rknn.py` quantizes to `artifacts/kws.rknn` (INT8, rv1106) and runs a simulator check; INT8↔float parity is 5/5 on the sampled calib clips.
+
+The remaining source files (`board/kws.c`, `board/Makefile`) are specified in the README but not yet written; treat the README as the design spec and this file as the architectural summary when implementing them.
+
+## Repository layout
+
+```
+pc/         PC-side Python (train_export.py; convert_rknn.py later)
+board/      board-side C (kws.c + Makefile later)
+artifacts/  generated outputs (kws_core.tflite, kws.rknn, labels.txt, dataset.txt, calib/) — gitignored
+data/       demo dataset downloads — gitignored
+.devcontainer/
+```
+
+`pc/train_export.py` resolves its output paths relative to the repo root (via `__file__`), so it can be launched from any directory. Run PC scripts from the repo root (e.g. `python pc/train_export.py`) so `dataset.txt`'s repo-root-relative calib paths resolve.
+
+## Dev environment
+
+All PC-side work is meant to run inside the dev container (`.devcontainer/`), which gives a clean, reproducible x86_64 Linux env separate from the host/WSL:
+
+- `Dockerfile` — `mcr.microsoft.com/devcontainers/python:3.10-bookworm`, pinned to `linux/amd64` (rknn-toolkit2 and the cross toolchain are x86_64-only). Installs `requirements.txt` (`tensorflow-cpu<2.16`, `numpy`, `rknn-toolkit2`) — CPU-only, no CUDA. `CUDA_VISIBLE_DEVICES=-1` is set so TF never probes for a GPU.
+- `devcontainer.json` — mounts a persistent `luckfox-sdks` volume at `/opt/sdks`, and exports `TOOLCHAIN` + `RKNN_RT` env vars pointing into it. **The `Makefile` must read these via `?=`** so it works in-container without edits.
+- `setup-sdks.sh` — opt-in, shallow-clones `luckfox-pico` + `rknn-toolkit2` into `/opt/sdks` (kept out of the image to stay small/fast). Run once per volume before cross-compiling.
+- `post-create.sh` — light verification only; does not clone the heavy SDKs.
+
+Claude Code (`@anthropic-ai/claude-code`) is installed in the image (via Node 20) and runs inside the container; its `~/.claude` config/login is persisted in a `luckfox-claude-config` volume, so you authenticate once.
+
+When changing PC-side deps, update `.devcontainer/requirements.txt` and the README "Prerequisites" together. The external SDKs (`luckfox-pico/`, `rknn-toolkit2/`) and build artifacts are gitignored.
 
 ## What this is
 
@@ -24,53 +53,60 @@ On-device wake-word detection (keyword spotting) for the Luckfox Pico (RV1103 / 
 ## Pipeline / file responsibilities
 
 ```
-PC (x86_64 Linux)                          Luckfox Pico (RV1103/RV1106)
-train_export.py  → kws_core.tflite         arecord (S16_LE 16k mono) → stdin
-                   + calib/ + labels.txt   kws (C): STFT → INT8 quant → NPU
-convert_rknn.py  → kws.rknn                kws.rknn on NPU → logits → softmax
-                                           → "WAKE: yes (p=0.97)"
+PC (x86_64 Linux)                             Luckfox Pico (RV1103/RV1106)
+pc/train_export.py → artifacts/kws_core.tflite  arecord (S16_LE 16k mono) → stdin
+                     + calib/ + labels.txt      kws (C): STFT → INT8 quant → NPU
+pc/convert_rknn.py → artifacts/kws.rknn         kws.rknn on NPU → logits → softmax
+                                                → "WAKE: yes (p=0.97)"
 ```
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `train_export.py` | PC | Train CNN, export `kws_core.tflite` (no STFT), `calib/*.npy` + `dataset.txt`, `labels.txt` |
-| `convert_rknn.py` | PC | TFLite → `kws.rknn`, INT8, target `rv1106` (also valid for rv1103); runs simulator check |
-| `kws.c` | Board | Mic → STFT → NPU → wake-word logic |
-| `Makefile` | PC (cross-compile) | Build `kws` for ARM uClibc target |
+| `pc/train_export.py` | PC | Train CNN, export `artifacts/kws_core.tflite` (no STFT), `artifacts/calib/*.npy` + `dataset.txt`, `labels.txt` |
+| `pc/convert_rknn.py` | PC | TFLite → `artifacts/kws.rknn`, INT8, target `rv1106` (also valid for rv1103); runs simulator check |
+| `board/kws.c` | Board | Mic → STFT → NPU → wake-word logic |
+| `board/Makefile` | PC (cross-compile) | Build `kws` for ARM uClibc target |
 
-**Three coupling points that must stay in sync:**
-1. STFT parameters (window/hop/FFT) between `train_export.py` and `kws.c`.
-2. `labels.txt` ordering (**alphabetical**, not folder order) vs. the `LABELS[]` array and `WAKE_IDX` in `kws.c`.
-3. `NUM_CLASSES` in `kws.c` vs. the number of model outputs / lines in `labels.txt`.
+**Coupling points that must stay in sync (Python ↔ C):**
+1. STFT parameters (window/hop/FFT) between `pc/train_export.py` and `board/kws.c`.
+2. **Log spectrogram**: training uses `log(|stft| + 1e-6)`, so `board/kws.c` must use `logf(mag + 1e-6f)`.
+3. **Input scale**: WAV decodes to [-1, 1] in training; `board/kws.c` must divide int16 PCM by 32768 before the STFT (the baked-in Normalization layer depends on it).
+4. `labels.txt` ordering (**alphabetical**, not folder order) vs. the `LABELS[]` array and `WAKE_IDX` in `board/kws.c`.
+5. `NUM_CLASSES` in `board/kws.c` vs. the number of model outputs / lines in `labels.txt`.
 
 ## Commands
 
 ### PC setup
+Preferred: open in the dev container (`.devcontainer/`) — deps are preinstalled. Then, before cross-compiling, fetch the SDKs once:
+```bash
+bash .devcontainer/setup-sdks.sh                    # clones SDKs into /opt/sdks volume
+```
+Local alternative:
 ```bash
 pip install "tensorflow<2.16" numpy rknn-toolkit2   # rknn-toolkit2 is x86_64-only
 ```
 
 ### Train & export
 ```bash
-python train_export.py                  # demo: mini_speech_commands (8 words), wake word = "yes"
-python train_export.py path/to/dataset  # custom dataset
+python pc/train_export.py                  # demo: mini_speech_commands (8 words), wake word = "yes"
+python pc/train_export.py path/to/dataset  # custom dataset
 ```
-Custom dataset layout (1 s clips, 16 kHz mono WAV): `dataset/wake/`, `dataset/unknown/` (hard negatives), `dataset/noise/`.
+Custom dataset layout (1 s clips, 16 kHz mono WAV): `dataset/wake/`, `dataset/unknown/` (hard negatives), `dataset/noise/`. Outputs land in `artifacts/`.
 
 ### Convert to RKNN
 ```bash
-python convert_rknn.py                  # → kws.rknn, INT8, target rv1106
+python pc/convert_rknn.py               # → artifacts/kws.rknn, INT8, target rv1106
 ```
 
 ### Cross-compile board app
-Edit the two paths at the top of `Makefile` (`TOOLCHAIN`, `RKNN_RT`), update `LABELS[]`/`WAKE_IDX`/`NUM_CLASSES` in `kws.c` to match `labels.txt`, then:
+In the dev container `TOOLCHAIN`/`RKNN_RT` are already exported (no Makefile edit needed); locally, edit the two paths at the top of `board/Makefile`. Either way, update `LABELS[]`/`WAKE_IDX`/`NUM_CLASSES` in `board/kws.c` to match `artifacts/labels.txt`, then:
 ```bash
-make
+make -C board
 ```
 
 ### Deploy & run (board)
 ```bash
-scp kws kws.rknn root@<board-ip>:/root/
+scp board/kws artifacts/kws.rknn root@<board-ip>:/root/
 scp ~/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/armhf-uclibc/librknnmrt.so root@<board-ip>:/usr/lib/
 # on board:
 arecord -D hw:0,0 -f S16_LE -r 16000 -c 1 -t raw | ./kws kws.rknn
@@ -83,5 +119,7 @@ arecord -D hw:0,0 -f S16_LE -r 16000 -c 1 -t raw | ./kws kws.rknn
 ## Platform-specific gotchas
 
 - **RV1103/RV1106 support only the zero-copy RKNN API** (`rknn_create_mem` / `rknn_set_io_mem`). Do **not** use `rknn_inputs_set` from generic RK3588 examples.
-- Detector tuning constants live in a marked block in `kws.c`: `THRESHOLD` (0.85), `CONSEC_NEEDED` (2), `COOLDOWN_HOPS` (8), `HOP_SAMPLES` (4000 = 250 ms inference cadence).
-- INT8 quantization of linear-magnitude spectrograms has harsh dynamic range; the README recommends log-spectrograms (`tf.math.log(tf.abs(...)+1e-6)` / `logf(mag+1e-6f)`) for better accuracy — apply to both sides together.
+- **`onnx` version pin**: rknn-toolkit2 pulls `onnx>=1.16.1`, but `onnx>=1.18` references `ml_dtypes.float4_e2m1fn` (absent in the `ml_dtypes 0.3.x` that `tensorflow-cpu<2.16` pins), which crashes `from rknn.api import RKNN`. `requirements.txt` therefore caps `onnx>=1.16.1,<1.18`.
+- **RKNN calibration layout**: after `load_tflite` (NHWC), rknn's internal graph is **NCHW** and expects calibration `.npy` in NCHW. Phase-1 calib files are HWC `(124,129,1)`; `convert_rknn.py` transposes copies to `(1,124,129)` (rknn prepends batch → `(1,1,124,129)`) into `artifacts/_calib_nchw/`. Inference can stay NHWC via `data_format=["nhwc"]`.
+- Detector tuning constants live in a marked block in `board/kws.c`: `THRESHOLD` (0.85), `CONSEC_NEEDED` (2), `COOLDOWN_HOPS` (8), `HOP_SAMPLES` (4000 = 250 ms inference cadence).
+- `pc/train_export.py` already uses **log-spectrograms** (`tf.math.log(tf.abs(...)+1e-6)`); `board/kws.c` must match with `logf(mag+1e-6f)`. Both sides must always change together.
