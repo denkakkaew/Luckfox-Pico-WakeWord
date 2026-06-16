@@ -107,7 +107,12 @@ def main() -> None:
         sys.exit("error: no artifacts/calib/*.npy — run train_export.py first")
 
     rknn = RKNN(verbose=False)
-    rknn.config(target_platform=TARGET)  # INT8 (w8a8) is the default quantized_dtype
+    # INT8 (w8a8) is the default quantized_dtype; quantized_method='channel'
+    # (per-channel weights) is the default. quantized_algorithm='mmse' minimizes
+    # quantization MSE (vs 'normal' min/max) — important here because on real
+    # RV1106 hardware the 'normal' int8 quantization collapsed the model toward
+    # one class (the x86 simulator runs ~float and does NOT reveal this).
+    rknn.config(target_platform=TARGET, quantized_algorithm="mmse")
 
     if rknn.load_tflite(model=str(IN_TFLITE)) != 0:
         sys.exit("error: load_tflite failed")

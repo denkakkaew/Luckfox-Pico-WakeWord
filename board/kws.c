@@ -50,7 +50,10 @@
 #define FRAME_STEP    128          /* STFT hop within the 1 s window        */
 #define FFT_LENGTH    256          /* zero-padded FFT size                  */
 #define SPEC_FRAMES   124          /* 1 + (16000 - 255) / 128               */
-#define SPEC_BINS     129          /* 256 / 2 + 1                           */
+#define SPEC_BINS     128          /* rfft gives 129; drop Nyquist bin so the
+                                    * width is a multiple of 16 (RV1106 NPU pads
+                                    * the zero-copy input width to a 16-stride;
+                                    * 129->144 padding broke the C=1 input read). */
 #define SPEC_SIZE     (SPEC_FRAMES * SPEC_BINS)
 
 /* Label set — coupling contract #4. Mirror artifacts/labels.txt (alphabetical)
@@ -183,13 +186,10 @@ static void softmax(const float *logits, float *probs)
 
 /* ---------------------------------------------------------------------
  * RKNN context wrapper. RV1103/RV1106 support ONLY the zero-copy API
- * (rknn_create_mem / rknn_set_io_mem) — never rknn_inputs_set.
- *
- * We hand the runtime FLOAT32 input (NHWC) and request FLOAT32 output, so
- * the runtime performs the INT8 quantize/dequantize internally. This keeps
- * the C side identical to the float path the simulator validated in
- * pc/convert_rknn.py (float spectrogram in, float logits out) and avoids
- * re-deriving scale/zero-point here.
+ * (rknn_create_mem / rknn_set_io_mem) — never rknn_inputs_set. The mini
+ * runtime also requires NATIVE INT8 I/O (it won't accept FP32 tensors), so we
+ * quantize the spectrogram and dequantize the logits ourselves using the
+ * model's affine (scale, zero_point); see model_init() / model_infer().
  * ------------------------------------------------------------------- */
 typedef struct {
     rknn_context     ctx;
@@ -280,21 +280,19 @@ static int model_init(kws_model *m, const char *model_path)
         return -1;
     }
 
-    /* Feed FLOAT32 NHWC, receive FLOAT32 — runtime handles INT8 conversion.
-     * pass_through must be 0 so rknn_set_io_mem honours type/fmt and converts
-     * (pass_through=1 would feed the buffer straight to the node, un-quantized). */
-    m->in_attr.type  = RKNN_TENSOR_FLOAT32;
-    m->in_attr.fmt   = RKNN_TENSOR_NHWC;
-    m->in_attr.pass_through = 0;
-    m->out_attr.type = RKNN_TENSOR_FLOAT32;
-    m->out_attr.pass_through = 0;
-
-    m->in_mem = rknn_create_mem(m->ctx, m->in_attr.n_elems * sizeof(float));
-    m->out_mem = rknn_create_mem(m->ctx, m->out_attr.n_elems * sizeof(float));
+    /* The RV1103/RV1106 mini runtime requires NATIVE INT8 zero-copy I/O — it
+     * does NOT convert FP32 (rknn_set_io_mem rejects a FP32 tensor). So we keep
+     * the model's native INT8 type/fmt as queried, and quantize the spectrogram
+     * to INT8 / dequantize the INT8 logits ourselves in model_infer() using the
+     * affine (scale, zero_point) below. The input row pitch is w_stride, which
+     * is padded (e.g. 129 bins -> 144), so allocate size_with_stride. */
+    m->in_mem  = rknn_create_mem(m->ctx, m->in_attr.size_with_stride);
+    m->out_mem = rknn_create_mem(m->ctx, m->out_attr.size_with_stride);
     if (!m->in_mem || !m->out_mem) {
         fprintf(stderr, "error: rknn_create_mem failed\n");
         return -1;
     }
+    memset(m->in_mem->virt_addr, 0, m->in_attr.size_with_stride);
 
     if (rknn_set_io_mem(m->ctx, m->in_mem, &m->in_attr) < 0 ||
         rknn_set_io_mem(m->ctx, m->out_mem, &m->out_attr) < 0) {
@@ -315,10 +313,33 @@ static void model_release(kws_model *m)
         rknn_destroy(m->ctx);
 }
 
-/* Run one spectrogram through the NPU; fills logits[NUM_CLASSES]. */
+/* affine quantize one float to int8 using (scale, zero_point), clamped. */
+static int8_t quant_i8(float v, float scale, int zp)
+{
+    int q = (int)lrintf(v / scale) + zp;
+    if (q < -128) q = -128;
+    if (q > 127)  q = 127;
+    return (int8_t)q;
+}
+
+/* Run one spectrogram through the NPU; fills logits[NUM_CLASSES].
+ * Quantizes the (SPEC_FRAMES x SPEC_BINS) spectrogram into the INT8 input
+ * (honouring the padded row stride), then dequantizes the INT8 output. */
 static int model_infer(kws_model *m, const float *spec, float *logits)
 {
-    memcpy(m->in_mem->virt_addr, spec, SPEC_SIZE * sizeof(float));
+    const int   H  = (int)m->in_attr.dims[1];   /* frames = 124 */
+    const int   W  = (int)m->in_attr.dims[2];   /* bins   = 129 */
+    const int   ws = m->in_attr.w_stride ? (int)m->in_attr.w_stride : W;
+    const float si = m->in_attr.scale;
+    const int   zi = m->in_attr.zp;
+    int8_t     *in = (int8_t *)m->in_mem->virt_addr;
+
+    for (int h = 0; h < H; h++) {
+        const float *row = spec + (size_t)h * W;
+        int8_t      *dst = in + (size_t)h * ws;
+        for (int w = 0; w < W; w++)
+            dst[w] = quant_i8(row[w], si, zi);
+    }
 
     int ret = rknn_run(m->ctx, NULL);
     if (ret < 0) {
@@ -326,7 +347,11 @@ static int model_infer(kws_model *m, const float *spec, float *logits)
         return -1;
     }
 
-    memcpy(logits, m->out_mem->virt_addr, NUM_CLASSES * sizeof(float));
+    const float so = m->out_attr.scale;
+    const int   zo = m->out_attr.zp;
+    const int8_t *out = (const int8_t *)m->out_mem->virt_addr;
+    for (int i = 0; i < NUM_CLASSES; i++)
+        logits[i] = ((int)out[i] - zo) * so;   /* dequantize */
     return 0;
 }
 
@@ -396,6 +421,19 @@ int main(int argc, char **argv)
         softmax(logits, probs);
 
         float wake_p = probs[WAKE_IDX];
+
+#ifdef KWS_DEBUG
+        {
+            int top = 0;
+            for (int i = 1; i < NUM_CLASSES; i++)
+                if (probs[i] > probs[top])
+                    top = i;
+            fprintf(stderr, "[dbg] top=%-5s p=%.2f  %s=%.2f\n",
+                    LABELS[top], (double)probs[top],
+                    LABELS[WAKE_IDX], (double)wake_p);
+        }
+#endif
+
         if (wake_p >= THRESHOLD)
             consec++;
         else

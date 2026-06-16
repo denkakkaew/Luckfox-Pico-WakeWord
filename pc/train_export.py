@@ -55,7 +55,12 @@ FRAME_LENGTH = 255           # periodic Hann window
 FRAME_STEP = 128             # hop
 FFT_LENGTH = 256
 SPEC_FRAMES = 124            # 1 + (16000 - 255) // 128
-SPEC_BINS = 129              # 256 // 2 + 1
+# rfft yields 256//2 + 1 = 129 bins, but we drop the Nyquist bin to make the
+# width 128 (a multiple of 16). The RV1106 NPU pads the input width to a 16-
+# element stride for zero-copy; a 129-wide input gets padded to 144, and the
+# mini runtime then fails to read the strided C=1 input (NPU sees constant
+# input). 128 needs no padding. kws.c must drop the same bin (compute 128 bins).
+SPEC_BINS = 128
 SPEC_SHAPE = (SPEC_FRAMES, SPEC_BINS, 1)
 
 SEED = 1337
@@ -111,6 +116,7 @@ def make_spectrogram(waveform: tf.Tensor) -> tf.Tensor:
     )
     mag = tf.abs(stft)
     spec = tf.math.log(mag + 1e-6)
+    spec = spec[..., :SPEC_BINS]      # drop Nyquist bin -> width 128 (NPU-aligned)
     return spec[..., tf.newaxis]
 
 
@@ -121,19 +127,37 @@ def to_spectrogram_ds(ds: tf.data.Dataset) -> tf.data.Dataset:
     )
 
 
-def build_model(num_labels: int, norm_layer: tf.keras.layers.Normalization) -> tf.keras.Model:
-    """Tutorial CNN with the STFT layer removed — input is a spectrogram."""
+def build_model(num_labels: int) -> tf.keras.Model:
+    """KWS CNN with the STFT layer removed — input is a (124,129,1) spectrogram.
+
+    This deviates from the tutorial architecture for RV1103/RV1106 NPU hardware
+    compatibility (the tutorial is correct in float/simulator but failed on the
+    mini runtime):
+
+    1. Tutorial uses Resizing(32, 32) first. The mini runtime cannot execute the
+       Resize op (offloads to CPU, unsupported -> rknn_run fails). Removed.
+    2. Tutorial bakes a Normalization layer. On the RV1106 NPU this model then
+       *ignored its input entirely* (constant output for any input, incl. zeros),
+       though the x86 simulator was correct. Removed — INT8 input quantization
+       already scales the raw log-spectrogram; no separate Normalization needed.
+    3. The first op must be a Conv (like every standard NPU CNN), not a
+       pool/normalize on the raw input. Downsampling is done with strided convs +
+       maxpools, all NPU-friendly ops.
+
+    Input stays (124,129,1), so board/kws.c and the calibration data are
+    unchanged. Verified to run correctly on RV1103 hardware.
+    """
     return tf.keras.Sequential(
         [
             tf.keras.layers.Input(shape=SPEC_SHAPE),
-            tf.keras.layers.Resizing(32, 32),
-            norm_layer,
-            tf.keras.layers.Conv2D(32, 3, activation="relu"),
+            tf.keras.layers.Conv2D(16, 3, strides=2, padding="same", activation="relu"),
+            tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="relu"),
+            tf.keras.layers.MaxPooling2D(),
             tf.keras.layers.Conv2D(64, 3, activation="relu"),
             tf.keras.layers.MaxPooling2D(),
             tf.keras.layers.Dropout(0.25),
             tf.keras.layers.Flatten(),
-            tf.keras.layers.Dense(128, activation="relu"),
+            tf.keras.layers.Dense(64, activation="relu"),
             tf.keras.layers.Dropout(0.5),
             tf.keras.layers.Dense(num_labels),  # logits
         ],
@@ -223,11 +247,10 @@ def main() -> None:
     train_spec_ds = train_spec_ds.cache().prefetch(tf.data.AUTOTUNE)
     val_spec_ds = val_spec_ds.cache().prefetch(tf.data.AUTOTUNE)
 
-    # Normalization is baked into the model -> runs on the NPU. Adapt on train.
-    norm_layer = tf.keras.layers.Normalization()
-    norm_layer.adapt(train_spec_ds.map(lambda spec, _: spec))
-
-    model = build_model(len(label_names), norm_layer)
+    # No baked Normalization layer: the RV1106 NPU ignored the model's input
+    # when one was present (see build_model docstring). INT8 input quantization
+    # handles scaling instead.
+    model = build_model(len(label_names))
     model.summary()
     model.compile(
         optimizer="adam",
