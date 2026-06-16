@@ -4,10 +4,33 @@ This is the full record of deploying the wake-word model to a real **Luckfox
 Pico (RV1103, 64 MB)** and the still-open bug that blocks it. It covers what was
 made to work, every fix that was tried, and what's left.
 
-**Status:** the end-to-end *pipeline* runs on the NPU; the *model* collapses to a
-single class on hardware due to an **rknn-toolkit2 1.5.2 / RV1106 graph-lowering
-or NPU-execution bug** that the rknn simulator does not reveal. Diagnostic tools
-and the hardware-debug setup live in [`tools/rv1106_diag/`](../tools/rv1106_diag/).
+> ## ✅ RESOLVED (2026-06-16) — read this first
+>
+> The "collapse" was **not** an rknn/RV1106 graph or runtime bug. It was a
+> **host-side input bug in `board/kws.c`**. RV1106 zero-copy input must use the
+> **UINT8 fused-quantize pattern**: set `in_attr.type = RKNN_TENSOR_UINT8` (and
+> `fmt = NHWC`) *before* `rknn_set_io_mem`, then write **raw uint8 `[0,255]`**
+> and let the NPU fuse normalize+quantize. The mini runtime *reports* the input
+> as INT8; the old code believed it and quantized by hand, which silently
+> corrupted the input (negative log bins → sign-flipped bytes) and collapsed the
+> model. The feature is also conditioned for uint8: `log(mag + 1e-2)` normalized
+> into `[0,255]` on both sides. Reference: the official
+> `rknpu2/examples/RV1106_RV1103/rknn_mobilenet_demo/src/main.cc`
+> ("if set uint8, will fuse normalize and quantize to npu").
+>
+> With this, `kws` on the **1.5.2 mini runtime** classifies all 8 demo words
+> correctly on real audio (yes → p=0.99); `tools/rv1106_diag/specinfer.c` scores
+> 39/39 on calib, matching the toolkit's connected path. **No reflash, no driver
+> change, no rknnrt, no 3-channel input needed.** Parts A–D below are kept as the
+> chronological record — their "bit-width-independent graph-lowering bug"
+> conclusion was the **misdiagnosis** this resolution corrects (those INT8/INT16
+> runs were all fed the corrupted hand-quantized input).
+
+**Original (pre-resolution) status:** the end-to-end *pipeline* runs on the NPU;
+the *model* collapses to a single class on hardware — then attributed to an
+**rknn-toolkit2 1.5.2 / RV1106 graph-lowering or NPU-execution bug** that the
+rknn simulator does not reveal. Diagnostic tools and the hardware-debug setup
+live in [`tools/rv1106_diag/`](../tools/rv1106_diag/).
 
 ---
 

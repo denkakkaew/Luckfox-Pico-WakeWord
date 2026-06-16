@@ -7,15 +7,17 @@ deployed to the Luckfox Pico NPU via RKNN.
 The model detects a single **wake word** from a short list of keywords and prints
 a trigger you can hook up to GPIO, MQTT, an HTTP call, or anything else.
 
-> ⚠️ **Known issue (on-device inference).** The full pipeline runs on a real
-> Luckfox RV1103 and the NPU is healthy, but the model currently **collapses to
-> one class on hardware** due to an rknn-toolkit2 1.5.2 / RV1106 conversion bug
-> that the rknn simulator does not catch (the simulator runs ~float). The model
-> is correct in float, in true INT8 (TFLite), and in the simulator. See
-> [docs/RV1106-phase4-investigation.md](docs/RV1106-phase4-investigation.md) for
-> the full root-cause investigation, every fix tried, and the hardware-debug
-> tooling in [tools/rv1106_diag/](tools/rv1106_diag/). Also note: this board's
-> NPU driver (v0.9.2) needs the **rknpu2 v1.5.2** mini runtime, not the newer 2.x.
+> ✅ **On-device status: working.** `kws` runs on a real Luckfox RV1103 (1.5.2
+> mini runtime, NPU driver v0.9.2) and classifies all 8 demo words correctly from
+> real audio (wake word "yes" → p=0.99). An earlier "one-class collapse" turned
+> out to be a host-side input bug, **not** an rknn/graph bug: RV1106 zero-copy
+> input must use the **UINT8 fused-quantize pattern** — set
+> `in_attr.type = RKNN_TENSOR_UINT8` before `rknn_set_io_mem` and write raw
+> uint8 `[0,255]`, letting the NPU quantize. The feature is `log(mag+1e-2)`
+> normalized to `[0,255]` (both sides). Full chronology + hardware-debug tooling:
+> [docs/RV1106-phase4-investigation.md](docs/RV1106-phase4-investigation.md) and
+> [tools/rv1106_diag/](tools/rv1106_diag/). Note: this board's NPU driver
+> (v0.9.2) needs the **rknpu2 v1.5.2** mini runtime, not the newer 2.x.
 
 ---
 
