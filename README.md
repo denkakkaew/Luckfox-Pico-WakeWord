@@ -247,6 +247,71 @@ Hook your action into the `TODO` block near the bottom of `kws.c`.
 
 ---
 
+## Step 5 — Test on the board
+
+The bare board has **no mic**, so the easiest test feeds a recorded clip as raw
+PCM on stdin (`kws` expects **S16_LE, 16 kHz, mono, headerless**). The NPU device
+(`/dev/rknpu`) is root-only, so run as `root` (or with `sudo`).
+
+**Build with per-frame debug output** so you can see the predicted class each hop
+(otherwise `kws` only prints on a `WAKE` trigger):
+
+```bash
+"$TOOLCHAIN"gcc -O2 -Wall -DKWS_DEBUG -I"$RKNN_RT/include" \
+  -o board/kws board/kws.c -L"$RKNN_RT/armhf-uclibc" -lrknnmrt -lm -lpthread -ldl
+scp board/kws artifacts/kws.rknn root@<board>:~/
+```
+
+**Make a raw clip from any 1 s WAV** (16 kHz mono) and copy it over:
+
+```bash
+python - <<'PY'
+import numpy as np, wave
+w = wave.open("data/mini_speech_commands/yes/<file>.wav")
+a = np.frombuffer(w.readframes(w.getnframes()), "<i2")
+if len(a) < 16000: a = np.concatenate([a, np.zeros(16000 - len(a), "<i2")])
+np.tile(a, 2)[:32000].astype("<i2").tofile("/tmp/yes.raw")   # x2 so it fills >1 window
+PY
+scp /tmp/yes.raw root@<board>:~/
+```
+
+**On the board** — pipe the clip through the detector:
+
+```bash
+cat ~/yes.raw | ./kws kws.rknn
+# -> WAKE: yes (p=0.99)
+# with -DKWS_DEBUG you also see per-hop lines: [dbg] top=yes p=0.99 yes=0.99
+```
+
+If `kws` fails at init because the NPU is busy, free it first:
+`killall rknn_server start_rknn.sh 2>/dev/null`.
+
+### Accuracy sweep without audio (`specinfer`)
+
+To measure classification accuracy directly, feed pre-computed spectrograms
+(bypassing the STFT) with the diagnostic harness in
+[`tools/rv1106_diag/specinfer.c`](tools/rv1106_diag/specinfer.c). It reads a
+`SPEC_FRAMES*SPEC_BINS` (124×128) frame-major **float32** spectrogram already in
+the model's `[0,255]` feature range, runs one inference, and prints the argmax +
+logits:
+
+```bash
+"$TOOLCHAIN"gcc -O2 -I"$RKNN_RT/include" -o /tmp/specinfer tools/rv1106_diag/specinfer.c \
+  -L"$RKNN_RT/armhf-uclibc" -lrknnmrt -lm -lpthread -ldl
+scp /tmp/specinfer root@<board>:~/
+# on the board:
+./specinfer kws.rknn spec/calib_000.f32     # -> argmax=7 (= "yes")  logits: ...
+```
+
+> **Why raw uint8 input?** `kws.c` sets the input tensor type to
+> `RKNN_TENSOR_UINT8` and writes the `[0,255]` feature as **raw bytes**, letting
+> the NPU fuse normalize+quantize. Do **not** hand-quantize to int8 — the mini
+> runtime reports the input as INT8, but feeding it int8 corrupts the input and
+> collapses the model to one class. See
+> [docs/RV1106-phase4-investigation.md](docs/RV1106-phase4-investigation.md).
+
+---
+
 ## Tuning the detector
 
 All in the marked block in `kws.c`:
