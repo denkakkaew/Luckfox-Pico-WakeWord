@@ -34,6 +34,10 @@ Things tried that did **not** fix the hardware collapse:
 - `quantized_algorithm='mmse'`
 - `build(do_quantization=False)` from a PTQ INT8 TFLite (changed the failure
   from a hard one-class collapse to varied-but-wrong output)
+- **`quantized_dtype='asymmetric_quantized-16'` (INT16)** — builds and runs on
+  the NPU but **collapses identically**. With 16 bits of headroom this rules out
+  saturation / requant-precision as the cause: **the bug is bit-width-independent**,
+  i.e. a graph-lowering / NPU-execution problem, not a quantization-quality one.
 - NB: rknn forces **INT8 input** for rv1106 regardless of the source TFLite's
   `inference_input_type` (a uint8-input model still exports as int8 input).
 
