@@ -7,6 +7,18 @@ deployed to the Luckfox Pico NPU via RKNN.
 The model detects a single **wake word** from a short list of keywords and prints
 a trigger you can hook up to GPIO, MQTT, an HTTP call, or anything else.
 
+> ✅ **On-device status: working.** `kws` runs on a real Luckfox RV1103 (1.5.2
+> mini runtime, NPU driver v0.9.2) and classifies all 8 demo words correctly from
+> real audio (wake word "yes" → p=0.99). An earlier "one-class collapse" turned
+> out to be a host-side input bug, **not** an rknn/graph bug: RV1106 zero-copy
+> input must use the **UINT8 fused-quantize pattern** — set
+> `in_attr.type = RKNN_TENSOR_UINT8` before `rknn_set_io_mem` and write raw
+> uint8 `[0,255]`, letting the NPU quantize. The feature is `log(mag+1e-2)`
+> normalized to `[0,255]` (both sides). Full chronology + hardware-debug tooling:
+> [docs/RV1106-phase4-investigation.md](docs/RV1106-phase4-investigation.md) and
+> [tools/rv1106_diag/](tools/rv1106_diag/). Note: this board's NPU driver
+> (v0.9.2) needs the **rknpu2 v1.5.2** mini runtime, not the newer 2.x.
+
 ---
 
 ## The one thing you must understand first
@@ -201,14 +213,20 @@ You'll also need `librknnmrt.so` on the board (see Step 4).
 
 ## Step 4 — Deploy & run (board)
 
-Copy the binary, the model, and the runtime library:
+Copy the binary, the model, and the runtime library. This assumes the default
+Luckfox login over the USB gadget (`pico@172.32.0.70`, password `luckfox` — adjust
+user/IP for your board). The `pico` user can't write to `/root` or `/usr/lib`
+directly, so copy to its home dir and move the library with `sudo`:
 
 ```bash
-scp board/kws artifacts/kws.rknn root@<board-ip>:/root/
+scp board/kws artifacts/kws.rknn pico@172.32.0.70:~/
 scp ~/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api/armhf-uclibc/librknnmrt.so \
-    root@<board-ip>:/usr/lib/
+    pico@172.32.0.70:~/
 # In the dev container the runtime lives under $RKNN_RT:
-# scp "$RKNN_RT/armhf-uclibc/librknnmrt.so" root@<board-ip>:/usr/lib/
+# scp "$RKNN_RT/armhf-uclibc/librknnmrt.so" pico@172.32.0.70:~/
+
+# then on the board, install the runtime lib:
+ssh pico@172.32.0.70 'sudo mv ~/librknnmrt.so /usr/lib/'
 ```
 
 On the board:

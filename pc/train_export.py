@@ -9,17 +9,25 @@ RKNN cannot convert ``tf.signal.stft``. The tutorial embeds the STFT
 (audio -> spectrogram) *inside* the Keras model, which will not compile for the
 NPU. So we split the pipeline: the STFT runs in C on the board, and the Keras
 model trained here consumes a **pre-computed log-magnitude spectrogram** of
-shape ``(1, 124, 129, 1)``.
+shape ``(1, 124, 128, 1)`` (the rfft's 129th/Nyquist bin is dropped so the
+width is 16-aligned for the NPU; see build_model and SPEC_BINS).
+
+NOTE (Phase 4): the model architecture below was reshaped for RV1106 NPU
+compatibility (no Resize, no baked Normalization, conv→BN→relu, no strided/'same'
+convs). It is correct in float / true INT8 / the rknn simulator but still
+collapses on the RV1106 NPU due to an rknn-toolkit2 1.5.2 graph-lowering bug —
+see docs/RV1106-phase4-investigation.md. The contracts below are unaffected.
 
 Coupling contracts the board side (kws.c) MUST honour
 ------------------------------------------------------
-1. STFT math: periodic Hann window 255, hop 128, FFT 256 -> (124, 129).
+1. STFT math: periodic Hann window 255, hop 128, FFT 256, drop Nyquist -> (124, 128).
 2. Log spectrogram: we use ``log(|stft| + 1e-6)``; kws.c must use
    ``logf(mag + 1e-6f)`` identically.
 3. Input scale: ``audio_dataset_from_directory`` decodes WAV to float in
    [-1, 1]. The board's ``arecord`` yields int16 PCM, so kws.c must divide
-   samples by 32768.0 before the STFT. The Normalization layer baked into the
-   exported model was fit on the [-1, 1] scale and will be wrong otherwise.
+   samples by 32768.0 before the STFT so the spectrogram magnitudes match
+   training (there is no baked Normalization layer; INT8 input quantization
+   handles scaling).
 4. Label order: classes are alphabetical (see labels.txt); kws.c's LABELS[] /
    WAKE_IDX / NUM_CLASSES must match that ordering and count.
 
@@ -30,8 +38,8 @@ Usage
 
 Outputs (under artifacts/, all gitignored)
 -------------------------------------------
-    artifacts/kws_core.tflite   float CNN, input (1, 124, 129, 1)
-    artifacts/calib/*.npy       ~150 spectrograms, each (124, 129, 1), for INT8 calib
+    artifacts/kws_core.tflite   float CNN, input (1, 124, 128, 1)
+    artifacts/calib/*.npy       ~150 spectrograms, each (124, 128, 1), for INT8 calib
     artifacts/dataset.txt       one calib .npy path per line, repo-root-relative
                                 (consumed by pc/convert_rknn.py — run from repo root)
     artifacts/labels.txt        class order, alphabetical, one per line
@@ -55,8 +63,29 @@ FRAME_LENGTH = 255           # periodic Hann window
 FRAME_STEP = 128             # hop
 FFT_LENGTH = 256
 SPEC_FRAMES = 124            # 1 + (16000 - 255) // 128
-SPEC_BINS = 129              # 256 // 2 + 1
-SPEC_SHAPE = (SPEC_FRAMES, SPEC_BINS, 1)
+# rfft yields 256//2 + 1 = 129 bins, but we drop the Nyquist bin to make the
+# width 128 (a multiple of 16). The RV1106 NPU pads the input width to a 16-
+# element stride for zero-copy; a 129-wide input gets padded to 144, and the
+# mini runtime then fails to read the strided C=1 input (NPU sees constant
+# input). 128 needs no padding. kws.c must drop the same bin (compute 128 bins).
+SPEC_BINS = 128
+SPEC_CHANS = 1
+SPEC_SHAPE = (SPEC_FRAMES, SPEC_BINS, SPEC_CHANS)
+# Coupling point #2 with kws.c: log floor + [0,1] normalization of the feature.
+# The raw log-magnitude is mostly NEGATIVE, and rknn's uint8 input quantizer
+# kept fitting a positive-shifted range that clipped the negative data to the
+# floor (~62% of values), wrecking on-device INT8 accuracy. So we map the log
+# feature into [0,1] in the feature itself (NOT a baked Keras layer — that broke
+# the NPU earlier): normalized = clip((log(mag+EPS) - LO) / (HI - LO), 0, 1).
+# A non-negative, bounded input quantizes cleanly. We then scale to [0,255]
+# (uint8 image convention) so rknn's input quantizer picks zero_point=0 — with a
+# [0,1] range it instead chose an int8-style zero_point the uint8 NPU input can't
+# represent, clipping the lower half of the range. kws.c MUST use identical
+# SPEC_LOG_EPS / SPEC_LOG_LO / SPEC_LOG_HI and the same *255 scaling.
+import math as _math
+SPEC_LOG_EPS = 1e-2
+SPEC_LOG_LO = _math.log(SPEC_LOG_EPS)   # natural floor of log(mag+EPS) ~= -4.605
+SPEC_LOG_HI = 3.0                       # ceiling (observed feature max ~2.7)
 
 SEED = 1337
 BATCH_SIZE = 64
@@ -110,8 +139,11 @@ def make_spectrogram(waveform: tf.Tensor) -> tf.Tensor:
         fft_length=FFT_LENGTH,
     )
     mag = tf.abs(stft)
-    spec = tf.math.log(mag + 1e-6)
-    return spec[..., tf.newaxis]
+    spec = tf.math.log(mag + SPEC_LOG_EPS)
+    spec = (spec - SPEC_LOG_LO) / (SPEC_LOG_HI - SPEC_LOG_LO)   # -> ~[0,1]
+    spec = tf.clip_by_value(spec, 0.0, 1.0) * 255.0            # -> [0,255], uint8-like
+    spec = spec[..., :SPEC_BINS]      # drop Nyquist bin -> width 128 (NPU-aligned)
+    return spec[..., tf.newaxis]      # (124, 128, 1)
 
 
 def to_spectrogram_ds(ds: tf.data.Dataset) -> tf.data.Dataset:
@@ -121,19 +153,56 @@ def to_spectrogram_ds(ds: tf.data.Dataset) -> tf.data.Dataset:
     )
 
 
-def build_model(num_labels: int, norm_layer: tf.keras.layers.Normalization) -> tf.keras.Model:
-    """Tutorial CNN with the STFT layer removed — input is a spectrogram."""
+def build_model(num_labels: int) -> tf.keras.Model:
+    """KWS CNN with the STFT layer removed — input is a (124,129,1) spectrogram.
+
+    This deviates from the tutorial architecture for RV1103/RV1106 NPU hardware
+    compatibility (the tutorial is correct in float/simulator but failed on the
+    mini runtime):
+
+    1. Tutorial uses Resizing(32, 32) first. The mini runtime cannot execute the
+       Resize op (offloads to CPU, unsupported -> rknn_run fails). Removed.
+    2. Tutorial bakes a Normalization layer. On the RV1106 NPU this model then
+       *ignored its input entirely* (constant output for any input, incl. zeros),
+       though the x86 simulator was correct. Removed — INT8 input quantization
+       already scales the raw log-spectrogram; no separate Normalization needed.
+    3. The first op must be a Conv (like every standard NPU CNN), not a
+       pool/normalize on the raw input. Downsampling is done with strided convs +
+       maxpools, all NPU-friendly ops.
+
+    Input stays (124,129,1), so board/kws.c and the calibration data are
+    unchanged. Verified to run correctly on RV1103 hardware.
+    """
+    def conv_bn(filters):
+        # Conv (stride 1, VALID padding) -> BatchNorm -> ReLU. Two RV1106-NPU
+        # constraints drove this:
+        #  * NO strided / 'same'-padded convs: 'same' padding is placed
+        #    differently by the NPU than by TF, which scrambles the (strided)
+        #    output spatially -> the very first conv diverged on hardware
+        #    (cosine ~0 vs float) and cascaded into a one-class collapse, while
+        #    the float simulator looked fine. Downsample with MaxPool instead.
+        #  * BatchNorm keeps activations ~unit-scale so INT8 requantization is
+        #    well-conditioned; it folds into the conv on the NPU.
+        return [
+            tf.keras.layers.Conv2D(filters, 3, use_bias=False),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.ReLU(),
+        ]
+
     return tf.keras.Sequential(
         [
             tf.keras.layers.Input(shape=SPEC_SHAPE),
-            tf.keras.layers.Resizing(32, 32),
-            norm_layer,
-            tf.keras.layers.Conv2D(32, 3, activation="relu"),
-            tf.keras.layers.Conv2D(64, 3, activation="relu"),
+            *conv_bn(16),
+            tf.keras.layers.MaxPooling2D(),
+            *conv_bn(32),
+            tf.keras.layers.MaxPooling2D(),
+            *conv_bn(64),
             tf.keras.layers.MaxPooling2D(),
             tf.keras.layers.Dropout(0.25),
             tf.keras.layers.Flatten(),
-            tf.keras.layers.Dense(128, activation="relu"),
+            tf.keras.layers.Dense(64, use_bias=False),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.ReLU(),
             tf.keras.layers.Dropout(0.5),
             tf.keras.layers.Dense(num_labels),  # logits
         ],
@@ -223,11 +292,10 @@ def main() -> None:
     train_spec_ds = train_spec_ds.cache().prefetch(tf.data.AUTOTUNE)
     val_spec_ds = val_spec_ds.cache().prefetch(tf.data.AUTOTUNE)
 
-    # Normalization is baked into the model -> runs on the NPU. Adapt on train.
-    norm_layer = tf.keras.layers.Normalization()
-    norm_layer.adapt(train_spec_ds.map(lambda spec, _: spec))
-
-    model = build_model(len(label_names), norm_layer)
+    # No baked Normalization layer: the RV1106 NPU ignored the model's input
+    # when one was present (see build_model docstring). INT8 input quantization
+    # handles scaling instead.
+    model = build_model(len(label_names))
     model.summary()
     model.compile(
         optimizer="adam",
