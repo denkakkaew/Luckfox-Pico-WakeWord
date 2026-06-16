@@ -69,14 +69,23 @@ SPEC_FRAMES = 124            # 1 + (16000 - 255) // 128
 # mini runtime then fails to read the strided C=1 input (NPU sees constant
 # input). 128 needs no padding. kws.c must drop the same bin (compute 128 bins).
 SPEC_BINS = 128
-# Phase 4 experiment: replicate the single-channel spectrogram across 3 input
-# channels. Hypothesis — the 1-input-channel first conv is a degenerate
-# NC1HWC2 (C2=16) tiling case that rknn-toolkit2 1.5.2 mis-lowers on the RV1106,
-# while a 3-channel input (like the known-good mobilenet RGB stem) takes the
-# well-trodden path. kws.c must write the spectrogram into all SPEC_CHANS
-# channels to match. Set back to 1 to revert.
-SPEC_CHANS = 3
+SPEC_CHANS = 1
 SPEC_SHAPE = (SPEC_FRAMES, SPEC_BINS, SPEC_CHANS)
+# Coupling point #2 with kws.c: log floor + [0,1] normalization of the feature.
+# The raw log-magnitude is mostly NEGATIVE, and rknn's uint8 input quantizer
+# kept fitting a positive-shifted range that clipped the negative data to the
+# floor (~62% of values), wrecking on-device INT8 accuracy. So we map the log
+# feature into [0,1] in the feature itself (NOT a baked Keras layer — that broke
+# the NPU earlier): normalized = clip((log(mag+EPS) - LO) / (HI - LO), 0, 1).
+# A non-negative, bounded input quantizes cleanly. We then scale to [0,255]
+# (uint8 image convention) so rknn's input quantizer picks zero_point=0 — with a
+# [0,1] range it instead chose an int8-style zero_point the uint8 NPU input can't
+# represent, clipping the lower half of the range. kws.c MUST use identical
+# SPEC_LOG_EPS / SPEC_LOG_LO / SPEC_LOG_HI and the same *255 scaling.
+import math as _math
+SPEC_LOG_EPS = 1e-2
+SPEC_LOG_LO = _math.log(SPEC_LOG_EPS)   # natural floor of log(mag+EPS) ~= -4.605
+SPEC_LOG_HI = 3.0                       # ceiling (observed feature max ~2.7)
 
 SEED = 1337
 BATCH_SIZE = 64
@@ -130,11 +139,11 @@ def make_spectrogram(waveform: tf.Tensor) -> tf.Tensor:
         fft_length=FFT_LENGTH,
     )
     mag = tf.abs(stft)
-    spec = tf.math.log(mag + 1e-6)
+    spec = tf.math.log(mag + SPEC_LOG_EPS)
+    spec = (spec - SPEC_LOG_LO) / (SPEC_LOG_HI - SPEC_LOG_LO)   # -> ~[0,1]
+    spec = tf.clip_by_value(spec, 0.0, 1.0) * 255.0            # -> [0,255], uint8-like
     spec = spec[..., :SPEC_BINS]      # drop Nyquist bin -> width 128 (NPU-aligned)
-    spec = spec[..., tf.newaxis]      # (124, 128, 1)
-    # Replicate to SPEC_CHANS identical channels (see SPEC_CHANS note).
-    return tf.repeat(spec, SPEC_CHANS, axis=-1)
+    return spec[..., tf.newaxis]      # (124, 128, 1)
 
 
 def to_spectrogram_ds(ds: tf.data.Dataset) -> tf.data.Dataset:

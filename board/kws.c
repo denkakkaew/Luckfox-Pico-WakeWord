@@ -54,11 +54,14 @@
                                     * width is a multiple of 16 (RV1106 NPU pads
                                     * the zero-copy input width to a 16-stride;
                                     * 129->144 padding broke the C=1 input read). */
-/* Phase 4 fix: the model input is the single-channel log-spectrogram REPLICATED
- * across SPEC_CHANS channels. A 1-input-channel first conv was mis-lowered by
- * rknn on the RV1106 (one-class collapse); 3 channels (like mobilenet's RGB
- * stem) takes the well-trodden path. Must match SPEC_CHANS in train_export.py. */
-#define SPEC_CHANS    3
+#define SPEC_CHANS    1            /* input channels; must match train_export.py */
+/* Coupling point #2: log floor + [0,1] normalization. Must match the values in
+ * pc/train_export.py (SPEC_LOG_EPS / SPEC_LOG_LO / SPEC_LOG_HI). The feature is
+ * normalized into [0,1] so the NPU's uint8 input quantizer (which fits a
+ * positive range) does not clip the otherwise-negative log-magnitude data. */
+#define SPEC_LOG_EPS  1e-2f
+#define SPEC_LOG_LO   (-4.6051702f)   /* logf(1e-2) */
+#define SPEC_LOG_HI   3.0f
 #define SPEC_SIZE     (SPEC_FRAMES * SPEC_BINS)              /* per channel */
 #define IN_ELEMS      (SPEC_FRAMES * SPEC_BINS * SPEC_CHANS) /* total input  */
 
@@ -166,7 +169,10 @@ static void compute_spectrogram(const float *window, float *out)
         float *row = out + (size_t)f * SPEC_BINS;
         for (int k = 0; k < SPEC_BINS; k++) {
             float mag = sqrtf(re[k] * re[k] + im[k] * im[k]);
-            row[k] = logf(mag + 1e-6f);   /* coupling contract #2 */
+            float lg = logf(mag + SPEC_LOG_EPS);            /* coupling contract #2 */
+            float nv = (lg - SPEC_LOG_LO) / (SPEC_LOG_HI - SPEC_LOG_LO);
+            nv = nv < 0.0f ? 0.0f : (nv > 1.0f ? 1.0f : nv);
+            row[k] = nv * 255.0f;                            /* -> [0,255], uint8-like */
         }
     }
 }
@@ -293,12 +299,15 @@ static int model_init(kws_model *m, const char *model_path)
         return -1;
     }
 
-    /* The RV1103/RV1106 mini runtime requires NATIVE INT8 zero-copy I/O — it
-     * does NOT convert FP32 (rknn_set_io_mem rejects a FP32 tensor). So we keep
-     * the model's native INT8 type/fmt as queried, and quantize the spectrogram
-     * to INT8 / dequantize the INT8 logits ourselves in model_infer() using the
-     * affine (scale, zero_point) below. The input row pitch is w_stride, which
-     * is padded (e.g. 129 bins -> 144), so allocate size_with_stride. */
+    /* RV1106 zero-copy input, the official RV1106 way: override the input tensor
+     * type to UINT8 so the NPU FUSES normalize+quantize internally, then feed it
+     * RAW uint8 [0,255] values (see compute_spectrogram's [0,255] scaling). The
+     * runtime reports the input as INT8 and, left that way, expects us to
+     * quantize+normalize by hand — getting that subtly wrong silently corrupts
+     * the input and collapses the model. Letting the NPU do it is both correct
+     * and simpler. The row pitch is w_stride; allocate size_with_stride. */
+    m->in_attr.type = RKNN_TENSOR_UINT8;
+    m->in_attr.fmt  = RKNN_TENSOR_NHWC;
     m->in_mem  = rknn_create_mem(m->ctx, m->in_attr.size_with_stride);
     m->out_mem = rknn_create_mem(m->ctx, m->out_attr.size_with_stride);
     if (!m->in_mem || !m->out_mem) {
@@ -326,46 +335,29 @@ static void model_release(kws_model *m)
         rknn_destroy(m->ctx);
 }
 
-/* affine quantize one float to int8/uint8 using (scale, zero_point), clamped. */
-static int quant_q(float v, float scale, int zp, int is_unsigned)
-{
-    int q = (int)lrintf(v / scale) + zp;
-    int lo = is_unsigned ? 0 : -128;
-    int hi = is_unsigned ? 255 : 127;
-    if (q < lo) q = lo;
-    if (q > hi) q = hi;
-    return q;
-}
-
 /* Run one spectrogram through the NPU; fills logits[NUM_CLASSES].
- * The single-channel (SPEC_FRAMES x SPEC_BINS) spectrogram is quantized and
- * REPLICATED into all SPEC_CHANS input channels (NHWC, channels innermost,
- * honouring the padded row stride), then the output is dequantized. The mini
- * runtime reports the native I/O dtype (int8 or uint8); we honour whichever. */
+ * The single-channel (SPEC_FRAMES x SPEC_BINS) spectrogram — already scaled to
+ * [0,255] by compute_spectrogram — is written as RAW uint8 and REPLICATED into
+ * all SPEC_CHANS input channels (NHWC, channels innermost, honouring the padded
+ * row stride). The NPU fuses normalize+quantize (input type set to UINT8 in
+ * model_init); the int8 output is then dequantized here. */
 static int model_infer(kws_model *m, const float *spec, float *logits)
 {
     const int   H   = (int)m->in_attr.dims[1];  /* frames   = 124          */
     const int   W   = (int)m->in_attr.dims[2];  /* bins     = 128          */
     const int   C   = (int)m->in_attr.dims[3];  /* channels = SPEC_CHANS   */
     const int   ws  = m->in_attr.w_stride ? (int)m->in_attr.w_stride : W;
-    const float si  = m->in_attr.scale;
-    const int   zi  = m->in_attr.zp;
-    /* The model's input is UINT8 (the rknn toolkit quantizes the input that
-     * way), but the RV1106 mini runtime MIS-REPORTS in_attr.type as INT8. If we
-     * trusted that and wrote signed int8, the log-spectrogram's large negative
-     * bins map to high bytes the NPU reads as big POSITIVE uint8 values — the
-     * input is corrupted and the model collapses to one class (this was the
-     * whole "RV1106 collapse"). So force UINT8 input encoding. */
-    const int   uin = 1;
     uint8_t    *in  = (uint8_t *)m->in_mem->virt_addr;
 
     for (int h = 0; h < H; h++) {
         const float *row = spec + (size_t)h * W;
         for (int w = 0; w < W; w++) {
-            uint8_t q = (uint8_t)quant_q(row[w], si, zi, uin);
+            int b = (int)lrintf(row[w]);             /* feature already [0,255] */
+            if (b < 0)   b = 0;
+            if (b > 255) b = 255;
             uint8_t *dst = in + ((size_t)h * ws + w) * C;  /* NHWC, C innermost */
             for (int c = 0; c < C; c++)
-                dst[c] = q;
+                dst[c] = (uint8_t)b;
         }
     }
 
