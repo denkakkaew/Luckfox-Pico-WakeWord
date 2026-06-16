@@ -350,7 +350,13 @@ static int model_infer(kws_model *m, const float *spec, float *logits)
     const int   ws  = m->in_attr.w_stride ? (int)m->in_attr.w_stride : W;
     const float si  = m->in_attr.scale;
     const int   zi  = m->in_attr.zp;
-    const int   uin = (m->in_attr.type == RKNN_TENSOR_UINT8);
+    /* The model's input is UINT8 (the rknn toolkit quantizes the input that
+     * way), but the RV1106 mini runtime MIS-REPORTS in_attr.type as INT8. If we
+     * trusted that and wrote signed int8, the log-spectrogram's large negative
+     * bins map to high bytes the NPU reads as big POSITIVE uint8 values — the
+     * input is corrupted and the model collapses to one class (this was the
+     * whole "RV1106 collapse"). So force UINT8 input encoding. */
+    const int   uin = 1;
     uint8_t    *in  = (uint8_t *)m->in_mem->virt_addr;
 
     for (int h = 0; h < H; h++) {

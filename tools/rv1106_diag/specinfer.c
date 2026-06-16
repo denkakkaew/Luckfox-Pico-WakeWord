@@ -32,7 +32,7 @@ static int quant_q(float v, float sc, int zp, int uns) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) { fprintf(stderr, "usage: %s <model.rknn> <spec.f32>\n", argv[0]); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: %s <model.rknn> <spec.f32> [u8|i8]\n", argv[0]); return 2; }
 
     size_t msz = 0; void *md = read_file(argv[1], &msz);
     if (!md) { fprintf(stderr, "cannot read model\n"); return 1; }
@@ -46,6 +46,10 @@ int main(int argc, char **argv) {
     int H = in.dims[1], W = in.dims[2], C = in.dims[3];
     int ws = in.w_stride ? in.w_stride : W;
     int uin = (in.type == RKNN_TENSOR_UINT8);
+    /* Optional 4th arg forces the input encoding: "u8" or "i8". The mini
+     * runtime may report INT8 while the model was quantized UINT8 (or vice
+     * versa); this lets us probe which byte encoding the NPU actually wants. */
+    if (argc > 3) uin = (argv[3][0] == 'u');
     fprintf(stderr, "in dims=[%u,%u,%u,%u] type=%d ws=%d scale=%g zp=%d | out n=%u type=%d scale=%g zp=%d\n",
             in.dims[0], in.dims[1], in.dims[2], in.dims[3], in.type, ws, in.scale, in.zp,
             out.n_elems, out.type, out.scale, out.zp);
