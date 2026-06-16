@@ -54,7 +54,13 @@
                                     * width is a multiple of 16 (RV1106 NPU pads
                                     * the zero-copy input width to a 16-stride;
                                     * 129->144 padding broke the C=1 input read). */
-#define SPEC_SIZE     (SPEC_FRAMES * SPEC_BINS)
+/* Phase 4 fix: the model input is the single-channel log-spectrogram REPLICATED
+ * across SPEC_CHANS channels. A 1-input-channel first conv was mis-lowered by
+ * rknn on the RV1106 (one-class collapse); 3 channels (like mobilenet's RGB
+ * stem) takes the well-trodden path. Must match SPEC_CHANS in train_export.py. */
+#define SPEC_CHANS    3
+#define SPEC_SIZE     (SPEC_FRAMES * SPEC_BINS)              /* per channel */
+#define IN_ELEMS      (SPEC_FRAMES * SPEC_BINS * SPEC_CHANS) /* total input  */
 
 /* Label set — coupling contract #4. Mirror artifacts/labels.txt (alphabetical)
  * and set WAKE_IDX to your wake word's position in this array. */
@@ -268,12 +274,19 @@ static int model_init(kws_model *m, const char *model_path)
 
     /* Shape sanity — catches a LABELS[]/NUM_CLASSES vs. model mismatch
      * ("model shape mismatch" in the README troubleshooting). */
-    if (m->in_attr.n_elems != SPEC_SIZE) {
+    if (m->in_attr.n_elems != IN_ELEMS) {
         fprintf(stderr, "error: model input has %u elems, expected %d "
-                "(%dx%d spectrogram)\n",
-                m->in_attr.n_elems, SPEC_SIZE, SPEC_FRAMES, SPEC_BINS);
+                "(%dx%dx%d spectrogram)\n",
+                m->in_attr.n_elems, IN_ELEMS, SPEC_FRAMES, SPEC_BINS, SPEC_CHANS);
         return -1;
     }
+#ifdef KWS_DEBUG
+    fprintf(stderr, "[dbg] input attr: dims=[%u,%u,%u,%u] type=%d fmt=%d "
+            "w_stride=%u scale=%g zp=%d\n",
+            m->in_attr.dims[0], m->in_attr.dims[1], m->in_attr.dims[2],
+            m->in_attr.dims[3], (int)m->in_attr.type, (int)m->in_attr.fmt,
+            m->in_attr.w_stride, (double)m->in_attr.scale, m->in_attr.zp);
+#endif
     if (m->out_attr.n_elems != NUM_CLASSES) {
         fprintf(stderr, "error: model has %u outputs, but NUM_CLASSES=%d\n",
                 m->out_attr.n_elems, NUM_CLASSES);
@@ -313,32 +326,41 @@ static void model_release(kws_model *m)
         rknn_destroy(m->ctx);
 }
 
-/* affine quantize one float to int8 using (scale, zero_point), clamped. */
-static int8_t quant_i8(float v, float scale, int zp)
+/* affine quantize one float to int8/uint8 using (scale, zero_point), clamped. */
+static int quant_q(float v, float scale, int zp, int is_unsigned)
 {
     int q = (int)lrintf(v / scale) + zp;
-    if (q < -128) q = -128;
-    if (q > 127)  q = 127;
-    return (int8_t)q;
+    int lo = is_unsigned ? 0 : -128;
+    int hi = is_unsigned ? 255 : 127;
+    if (q < lo) q = lo;
+    if (q > hi) q = hi;
+    return q;
 }
 
 /* Run one spectrogram through the NPU; fills logits[NUM_CLASSES].
- * Quantizes the (SPEC_FRAMES x SPEC_BINS) spectrogram into the INT8 input
- * (honouring the padded row stride), then dequantizes the INT8 output. */
+ * The single-channel (SPEC_FRAMES x SPEC_BINS) spectrogram is quantized and
+ * REPLICATED into all SPEC_CHANS input channels (NHWC, channels innermost,
+ * honouring the padded row stride), then the output is dequantized. The mini
+ * runtime reports the native I/O dtype (int8 or uint8); we honour whichever. */
 static int model_infer(kws_model *m, const float *spec, float *logits)
 {
-    const int   H  = (int)m->in_attr.dims[1];   /* frames = 124 */
-    const int   W  = (int)m->in_attr.dims[2];   /* bins   = 129 */
-    const int   ws = m->in_attr.w_stride ? (int)m->in_attr.w_stride : W;
-    const float si = m->in_attr.scale;
-    const int   zi = m->in_attr.zp;
-    int8_t     *in = (int8_t *)m->in_mem->virt_addr;
+    const int   H   = (int)m->in_attr.dims[1];  /* frames   = 124          */
+    const int   W   = (int)m->in_attr.dims[2];  /* bins     = 128          */
+    const int   C   = (int)m->in_attr.dims[3];  /* channels = SPEC_CHANS   */
+    const int   ws  = m->in_attr.w_stride ? (int)m->in_attr.w_stride : W;
+    const float si  = m->in_attr.scale;
+    const int   zi  = m->in_attr.zp;
+    const int   uin = (m->in_attr.type == RKNN_TENSOR_UINT8);
+    uint8_t    *in  = (uint8_t *)m->in_mem->virt_addr;
 
     for (int h = 0; h < H; h++) {
         const float *row = spec + (size_t)h * W;
-        int8_t      *dst = in + (size_t)h * ws;
-        for (int w = 0; w < W; w++)
-            dst[w] = quant_i8(row[w], si, zi);
+        for (int w = 0; w < W; w++) {
+            uint8_t q = (uint8_t)quant_q(row[w], si, zi, uin);
+            uint8_t *dst = in + ((size_t)h * ws + w) * C;  /* NHWC, C innermost */
+            for (int c = 0; c < C; c++)
+                dst[c] = q;
+        }
     }
 
     int ret = rknn_run(m->ctx, NULL);
@@ -347,11 +369,14 @@ static int model_infer(kws_model *m, const float *spec, float *logits)
         return -1;
     }
 
-    const float so = m->out_attr.scale;
-    const int   zo = m->out_attr.zp;
-    const int8_t *out = (const int8_t *)m->out_mem->virt_addr;
-    for (int i = 0; i < NUM_CLASSES; i++)
-        logits[i] = ((int)out[i] - zo) * so;   /* dequantize */
+    const int      uout = (m->out_attr.type == RKNN_TENSOR_UINT8);
+    const float    so   = m->out_attr.scale;
+    const int      zo   = m->out_attr.zp;
+    const uint8_t *out  = (const uint8_t *)m->out_mem->virt_addr;
+    for (int i = 0; i < NUM_CLASSES; i++) {
+        int qv = uout ? (int)out[i] : (int)(int8_t)out[i];
+        logits[i] = (qv - zo) * so;            /* dequantize */
+    }
     return 0;
 }
 

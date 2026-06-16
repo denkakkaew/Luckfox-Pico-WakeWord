@@ -69,7 +69,14 @@ SPEC_FRAMES = 124            # 1 + (16000 - 255) // 128
 # mini runtime then fails to read the strided C=1 input (NPU sees constant
 # input). 128 needs no padding. kws.c must drop the same bin (compute 128 bins).
 SPEC_BINS = 128
-SPEC_SHAPE = (SPEC_FRAMES, SPEC_BINS, 1)
+# Phase 4 experiment: replicate the single-channel spectrogram across 3 input
+# channels. Hypothesis — the 1-input-channel first conv is a degenerate
+# NC1HWC2 (C2=16) tiling case that rknn-toolkit2 1.5.2 mis-lowers on the RV1106,
+# while a 3-channel input (like the known-good mobilenet RGB stem) takes the
+# well-trodden path. kws.c must write the spectrogram into all SPEC_CHANS
+# channels to match. Set back to 1 to revert.
+SPEC_CHANS = 3
+SPEC_SHAPE = (SPEC_FRAMES, SPEC_BINS, SPEC_CHANS)
 
 SEED = 1337
 BATCH_SIZE = 64
@@ -125,7 +132,9 @@ def make_spectrogram(waveform: tf.Tensor) -> tf.Tensor:
     mag = tf.abs(stft)
     spec = tf.math.log(mag + 1e-6)
     spec = spec[..., :SPEC_BINS]      # drop Nyquist bin -> width 128 (NPU-aligned)
-    return spec[..., tf.newaxis]
+    spec = spec[..., tf.newaxis]      # (124, 128, 1)
+    # Replicate to SPEC_CHANS identical channels (see SPEC_CHANS note).
+    return tf.repeat(spec, SPEC_CHANS, axis=-1)
 
 
 def to_spectrogram_ds(ds: tf.data.Dataset) -> tf.data.Dataset:
