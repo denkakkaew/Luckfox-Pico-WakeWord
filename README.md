@@ -7,6 +7,16 @@ deployed to the Luckfox Pico NPU via RKNN.
 The model detects a single **wake word** from a short list of keywords and prints
 a trigger you can hook up to GPIO, MQTT, an HTTP call, or anything else.
 
+> ⚠️ **Known issue (on-device inference).** The full pipeline runs on a real
+> Luckfox RV1103 and the NPU is healthy, but the model currently **collapses to
+> one class on hardware** due to an rknn-toolkit2 1.5.2 / RV1106 conversion bug
+> that the rknn simulator does not catch (the simulator runs ~float). The model
+> is correct in float, in true INT8 (TFLite), and in the simulator. See
+> [docs/RV1106-phase4-investigation.md](docs/RV1106-phase4-investigation.md) for
+> the full root-cause investigation, every fix tried, and the hardware-debug
+> tooling in [tools/rv1106_diag/](tools/rv1106_diag/). Also note: this board's
+> NPU driver (v0.9.2) needs the **rknpu2 v1.5.2** mini runtime, not the newer 2.x.
+
 ---
 
 ## The one thing you must understand first

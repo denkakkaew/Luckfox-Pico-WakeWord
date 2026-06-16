@@ -6,9 +6,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Phases 1–2 (PC side) are implemented and verified in the dev container:
 - `pc/train_export.py` trains the CNN and exports `artifacts/{kws_core.tflite, calib/*.npy, dataset.txt, labels.txt}` (test acc ~0.82 on the demo set).
-- `pc/convert_rknn.py` quantizes to `artifacts/kws.rknn` (INT8, rv1106) and runs a simulator check; INT8↔float parity is 5/5 on the sampled calib clips.
+- `pc/convert_rknn.py` quantizes to `artifacts/kws.rknn` (INT8, rv1106) and runs a simulator check. **Caveat learned in Phase 4: this simulator runs ~float — its logits match the float TFLite to within ~0.14, so the "parity" check does NOT validate INT8 behaviour on the NPU.**
 
-The remaining source files (`board/kws.c`, `board/Makefile`) are specified in the README but not yet written; treat the README as the design spec and this file as the architectural summary when implementing them.
+Phase 3 (`board/kws.c`, `board/Makefile`) is implemented: mic/stdin → STFT → INT8 zero-copy NPU inference → wake logic. Cross-compiles for the ARM uClibc target.
+
+**Phase 4 (on-board) — pipeline runs, model is blocked by an rknn/RV1106 bug.**
+The full chain runs on a real Luckfox RV1103 (Buildroot/uClibc) and the NPU is
+confirmed healthy (stock mobilenet classifies correctly), but the wake-word
+model **collapses to one class on hardware** while being correct in float, true
+INT8 (tf.lite), and the rknn simulator. Root-caused to an rknn-toolkit2 1.5.2 /
+RV1106 graph-lowering/execution bug that is **bit-width-independent** (INT8 and
+INT16 fail identically; first conv diverges). Full write-up, every fix tried, and
+the hardware-debug tooling: **[docs/RV1106-phase4-investigation.md](docs/RV1106-phase4-investigation.md)**
+and **[tools/rv1106_diag/](tools/rv1106_diag/)**. The board needs the **rknpu2
+v1.5.2 mini runtime** (`librknnmrt.so`) to match its NPU driver v0.9.2.
 
 ## Repository layout
 
