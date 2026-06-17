@@ -5,12 +5,16 @@ Reads the float TFLite + calibration set produced by pc/train_export.py and
 emits ``artifacts/kws.rknn`` (INT8, target rv1106 — also valid for rv1103),
 then runs the RKNN **simulator** on a few calibration samples so you can see
 class probabilities before touching the board. A best-effort parity check
-compares the INT8 simulator's predictions against the float TFLite to confirm
-quantization didn't break the model.
+compares the simulator's predictions against the float TFLite.
 
-No normalization is configured here (no mean/std): the model already bakes
-Resizing + Normalization into its graph, so the raw log-spectrogram .npy goes
-straight in.
+CAVEAT (learned in Phase 4): this simulator runs ~float — its logits match the
+float TFLite to within ~0.14, so the parity check does NOT validate INT8
+behaviour on the real NPU. Only on-board testing does that.
+
+No normalization is configured here (no mean/std): train_export.py already
+conditions the feature (log magnitude mapped into [0,255]) and the board feeds
+it as raw uint8, so the [0,255] log-spectrogram .npy goes straight in and the
+NPU's uint8 input quantizer scales it.
 
 Run from the repo root:  python pc/convert_rknn.py
 Inputs (from Phase 1):   artifacts/{kws_core.tflite, dataset.txt, calib/*.npy, labels.txt}
@@ -44,8 +48,8 @@ def prepare_calib_dataset() -> pathlib.Path:
 
     Two transforms vs the Phase-1 calib files:
       * Layout: rknn loads the NHWC TFLite into a channel-first graph and wants
-        calibration data in NCHW. We transpose each HWC (124,129,1) sample to
-        CHW (1,124,129); rknn prepends the batch dim -> (1,1,124,129).
+        calibration data in NCHW. We transpose each HWC (124,128,1) sample to
+        CHW (1,124,128); rknn prepends the batch dim -> (1,1,124,128).
       * Paths: dataset.txt holds repo-root-relative paths, but rknn resolves
         them against the CWD, so we emit absolute paths.
     """
@@ -57,8 +61,8 @@ def prepare_calib_dataset() -> pathlib.Path:
     rel = [ln for ln in DATASET_TXT.read_text().split() if ln.strip()]
     abs_paths: list[str] = []
     for ln in rel:
-        hwc = np.load(REPO_ROOT / ln)              # (124, 129, 1)
-        chw = np.transpose(hwc, (2, 0, 1))         # (1, 124, 129)
+        hwc = np.load(REPO_ROOT / ln)              # (124, 128, 1)
+        chw = np.transpose(hwc, (2, 0, 1))         # (1, 124, 128)
         dst = nchw_dir / pathlib.Path(ln).name
         np.save(dst, chw.astype(np.float32))
         abs_paths.append(str(dst.resolve()))
@@ -131,7 +135,7 @@ def main() -> None:
     print(f"\nSimulator predictions (target {TARGET}):")
     rknn_preds: list[int] = []
     for fp in samples:
-        x = np.load(fp)[np.newaxis, ...].astype(np.float32)  # (1, 124, 129, 1)
+        x = np.load(fp)[np.newaxis, ...].astype(np.float32)  # (1, 124, 128, 1)
         out = rknn.inference(inputs=[x], data_format=["nhwc"])
         probs = softmax(np.asarray(out[0][0], dtype=np.float32))
         idx = int(np.argmax(probs))

@@ -5,7 +5,7 @@
  *     arecord (S16_LE 16k mono) --stdin--> kws
  *         |  slide a 1 s window, every HOP_SAMPLES
  *         v
- *     STFT in C  ->  log-magnitude spectrogram (124 x 129)
+ *     STFT in C  ->  log [0,255] spectrogram (124 x 128)
  *         |
  *         v
  *     kws.rknn on the NPU (INT8)  ->  class logits
@@ -18,12 +18,16 @@
  * the CNN core runs on the NPU. The STFT math below MUST stay byte-for-byte
  * consistent with pc/train_export.py. The coupling contracts are:
  *
- *   1. STFT params: periodic Hann window 255, hop 128, FFT 256 -> (124, 129).
- *   2. Log spectrogram: training uses log(|stft| + 1e-6); we use
- *      logf(mag + 1e-6f) identically.
+ *   1. STFT params: periodic Hann window 255, hop 128, FFT 256, drop the
+ *      Nyquist bin -> (124, 128).
+ *   2. Log + [0,255] feature: training uses log(|stft| + SPEC_LOG_EPS) with
+ *      EPS = 1e-2, then maps it into [0,255] via
+ *      clip((x - SPEC_LOG_LO)/(SPEC_LOG_HI - LO), 0, 1) * 255; we reproduce that
+ *      exactly here. The [0,255] feature is fed as RAW uint8 and the NPU fuses
+ *      normalize+quantize — we do NOT hand-quantize the input.
  *   3. Input scale: training decodes WAV to float in [-1, 1]; arecord gives
- *      int16 PCM, so we divide each sample by 32768.0f before the STFT (the
- *      Normalization layer baked into the model was fit on the [-1, 1] scale).
+ *      int16 PCM, so we divide each sample by 32768.0f before the STFT so
+ *      magnitudes match training (there is no baked Normalization layer).
  *   4. Label order: LABELS[] / WAKE_IDX / NUM_CLASSES must match
  *      artifacts/labels.txt (alphabetical) and the model's output count.
  *
@@ -141,11 +145,12 @@ static void init_hann(void)
 
 /* ---------------------------------------------------------------------
  * compute_spectrogram: window (CLIP_SAMPLES floats in [-1,1]) ->
- * log-magnitude spectrogram out[SPEC_FRAMES * SPEC_BINS], frame-major
- * (HWC with C=1), matching the model's (1,124,129,1) input.
+ * log [0,255] spectrogram out[SPEC_FRAMES * SPEC_BINS], frame-major
+ * (HWC with C=1), matching the model's (1,124,128,1) input.
  *
  * Mirrors tf.signal.stft(frame_length=255, frame_step=128, fft_length=256):
  * frame i covers samples [i*128, i*128+255), windowed, zero-padded to 256.
+ * The rfft's 129th (Nyquist) bin is dropped so the width is 128 (NPU-aligned).
  * ------------------------------------------------------------------- */
 static void compute_spectrogram(const float *window, float *out)
 {
@@ -199,9 +204,11 @@ static void softmax(const float *logits, float *probs)
 /* ---------------------------------------------------------------------
  * RKNN context wrapper. RV1103/RV1106 support ONLY the zero-copy API
  * (rknn_create_mem / rknn_set_io_mem) — never rknn_inputs_set. The mini
- * runtime also requires NATIVE INT8 I/O (it won't accept FP32 tensors), so we
- * quantize the spectrogram and dequantize the logits ourselves using the
- * model's affine (scale, zero_point); see model_init() / model_infer().
+ * runtime uses native quantized I/O: we override the input tensor type to
+ * UINT8 and feed RAW uint8 [0,255], letting the NPU fuse normalize+quantize
+ * (do NOT hand-quantize the input — that was the Phase 4 collapse bug). Only
+ * the int8 output is dequantized here using the model's affine (scale,
+ * zero_point); see model_init() / model_infer().
  * ------------------------------------------------------------------- */
 typedef struct {
     rknn_context     ctx;

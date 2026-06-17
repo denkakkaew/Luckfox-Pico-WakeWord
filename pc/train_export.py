@@ -12,22 +12,29 @@ model trained here consumes a **pre-computed log-magnitude spectrogram** of
 shape ``(1, 124, 128, 1)`` (the rfft's 129th/Nyquist bin is dropped so the
 width is 16-aligned for the NPU; see build_model and SPEC_BINS).
 
-NOTE (Phase 4): the model architecture below was reshaped for RV1106 NPU
-compatibility (no Resize, no baked Normalization, conv→BN→relu, no strided/'same'
-convs). It is correct in float / true INT8 / the rknn simulator but still
-collapses on the RV1106 NPU due to an rknn-toolkit2 1.5.2 graph-lowering bug —
-see docs/RV1106-phase4-investigation.md. The contracts below are unaffected.
+NOTE (Phase 4 — SOLVED): the model architecture below was reshaped for RV1106
+NPU compatibility (no Resize, no baked Normalization, conv→BN→relu, no
+strided/'same' convs). The detector now runs correctly on real RV1103/RV1106
+hardware. The long-investigated "one-class collapse" was NOT an rknn /
+graph-lowering bug — it was a host-side input bug in board/kws.c: the RV1106
+zero-copy input must be fed as RAW uint8 [0,255] with the tensor type overridden
+to UINT8 so the NPU fuses normalize+quantize; the old code hand-quantized it as
+int8 and silently corrupted the input. See
+docs/RV1106-phase4-investigation.md. The contracts below are what kws.c mirrors.
 
 Coupling contracts the board side (kws.c) MUST honour
 ------------------------------------------------------
 1. STFT math: periodic Hann window 255, hop 128, FFT 256, drop Nyquist -> (124, 128).
-2. Log spectrogram: we use ``log(|stft| + 1e-6)``; kws.c must use
-   ``logf(mag + 1e-6f)`` identically.
+2. Log + [0,255] feature: we use ``log(|stft| + SPEC_LOG_EPS)`` (EPS = 1e-2),
+   then map it into [0,255] via ``clip((x - SPEC_LOG_LO)/(SPEC_LOG_HI - LO), 0, 1)
+   * 255``. kws.c must reproduce SPEC_LOG_EPS / SPEC_LOG_LO / SPEC_LOG_HI and the
+   *255 scaling identically. The board feeds this [0,255] feature as raw uint8
+   and lets the NPU quantize — do NOT hand-quantize.
 3. Input scale: ``audio_dataset_from_directory`` decodes WAV to float in
    [-1, 1]. The board's ``arecord`` yields int16 PCM, so kws.c must divide
    samples by 32768.0 before the STFT so the spectrogram magnitudes match
-   training (there is no baked Normalization layer; INT8 input quantization
-   handles scaling).
+   training (there is no baked Normalization layer; the UINT8 fused-quantize
+   NPU input handles scaling).
 4. Label order: classes are alphabetical (see labels.txt); kws.c's LABELS[] /
    WAKE_IDX / NUM_CLASSES must match that ordering and count.
 
@@ -128,9 +135,9 @@ def resolve_data_dir(arg: str | None) -> pathlib.Path:
 
 
 def make_spectrogram(waveform: tf.Tensor) -> tf.Tensor:
-    """Waveform (..., 16000) in [-1, 1] -> log-magnitude spectrogram (124, 129, 1).
+    """Waveform (..., 16000) in [-1, 1] -> log [0,255] spectrogram (124, 128, 1).
 
-    Coupling points #1 (STFT params) and #2 (log) with kws.c live here.
+    Coupling points #1 (STFT params) and #2 (log + [0,255]) with kws.c live here.
     """
     stft = tf.signal.stft(
         waveform,
@@ -154,7 +161,7 @@ def to_spectrogram_ds(ds: tf.data.Dataset) -> tf.data.Dataset:
 
 
 def build_model(num_labels: int) -> tf.keras.Model:
-    """KWS CNN with the STFT layer removed — input is a (124,129,1) spectrogram.
+    """KWS CNN with the STFT layer removed — input is a (124,128,1) spectrogram.
 
     This deviates from the tutorial architecture for RV1103/RV1106 NPU hardware
     compatibility (the tutorial is correct in float/simulator but failed on the
@@ -170,8 +177,9 @@ def build_model(num_labels: int) -> tf.keras.Model:
        pool/normalize on the raw input. Downsampling is done with strided convs +
        maxpools, all NPU-friendly ops.
 
-    Input stays (124,129,1), so board/kws.c and the calibration data are
-    unchanged. Verified to run correctly on RV1103 hardware.
+    Input is (124,128,1) (Nyquist bin dropped for NPU width alignment), which
+    board/kws.c and the calibration data mirror. Verified to run correctly on
+    RV1103 hardware.
     """
     def conv_bn(filters):
         # Conv (stride 1, VALID padding) -> BatchNorm -> ReLU. Two RV1106-NPU
@@ -211,7 +219,7 @@ def build_model(num_labels: int) -> tf.keras.Model:
 
 
 def export_calibration(train_spec_ds: tf.data.Dataset) -> None:
-    """Save ~N_CALIB spectrograms as (124,129,1) .npy + dataset.txt of paths.
+    """Save ~N_CALIB spectrograms as (124,128,1) .npy + dataset.txt of paths.
 
     No batch dim per file — matches the rknn-toolkit2 calibration convention
     (see README note); convert_rknn.py reads these in Phase 2.
@@ -224,7 +232,7 @@ def export_calibration(train_spec_ds: tf.data.Dataset) -> None:
     paths: list[str] = []
     count = 0
     for specs, _labels in train_spec_ds.unbatch().batch(1):
-        sample = specs[0].numpy().astype(np.float32)  # (124, 129, 1)
+        sample = specs[0].numpy().astype(np.float32)  # (124, 128, 1)
         fp = calib_dir / f"calib_{count:03d}.npy"
         np.save(fp, sample)
         # repo-root-relative so convert_rknn.py (run from repo root) resolves them.
@@ -245,7 +253,7 @@ def sanity_check(label_names: list[str]) -> None:
     out_detail = interp.get_output_details()[0]
 
     sample = np.load(sorted(OUT_CALIB_DIR.glob("*.npy"))[0])
-    x = sample[np.newaxis, ...].astype(in_detail["dtype"])  # (1, 124, 129, 1)
+    x = sample[np.newaxis, ...].astype(in_detail["dtype"])  # (1, 124, 128, 1)
     interp.set_tensor(in_detail["index"], x)
     interp.invoke()
     logits = interp.get_tensor(out_detail["index"])
